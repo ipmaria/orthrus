@@ -9,3 +9,15 @@ checkpoints/
 wandb/
 slurm-logs/
 *.log
+.venv-apptainer-py210/
+.venv-apptainer/
+=2.10.0
+src/model.py.before-a100
+training-code/*/__pycache__/
+training-code/*/__init__.pyc
+training-code/src/utils/__init__.pyc
+training-code/checkpoints/
+training-code/checkpoints/orthrus-qwen3-0.6b/final/step-*/
+training-code/data/
+training-code/pretrained-models/
+

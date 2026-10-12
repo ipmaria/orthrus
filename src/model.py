@@ -31,10 +31,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
 
 def fused_flex_attention(q, k, v, mask=None):
-    kernel_options = {"BACKEND": "FLASH"}
-    if mask is not None:
-        q_sparse_bs, kv_sparse_bs = mask.BLOCK_SIZE
-        kernel_options["sparse_block_size"] = (int(q_sparse_bs), int(kv_sparse_bs))
+    kernel_options = {"BACKEND": "TRITON"}
     return _compiled_flex_attention(
         q,
         k,

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orthrus"
+version = "0.1.0"
+description = "Memory-Efficient Parallel Token Generation via Dual-View Diffusion"
+readme = "README.md"
+# 3.10 is a hard floor: src/model.py and src/model_mlx.py use PEP-604 `X | None`
+# in runtime signatures without `from __future__ import annotations`.
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Chien Van Nguyen", email = "chienn@uoregon.edu" }
+]
+
+license = { text = "MIT" }
+
+dependencies = [
+    "torch>=2.12.0",
+    "transformers>=5.15.0",
+    "accelerate",
+    "datasets",
+    "flash-linear-attention",
+    "liger-kernel",
+    "numpy",
+]
+
+[project.optional-dependencies]
+train = ["wandb", "tqdm"]
+
+[project.urls]
+Repository = "https://github.com/chiennv2000/orthrus"
