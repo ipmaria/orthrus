@@ -20,4 +20,5 @@ training-code/checkpoints/
 training-code/checkpoints/orthrus-qwen3-0.6b/final/step-*/
 training-code/data/
 training-code/pretrained-models/
+training-code/ckpts/
 
