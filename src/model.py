@@ -1,3 +1,5 @@
+import importlib.util
+import os
 from typing import Optional, Callable
 from typing_extensions import Unpack, Tuple
 
@@ -29,27 +31,48 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+# Anchors are resampled every step, so the BlockMask is rebuilt every step. Uncompiled,
+# create_block_mask materialises a dense (B, H, Q, KV) bool tensor first; compiled it is
+# fused. Same trick as src/models/modeling_orthrus_qwen3_5.py.
+_compiled_create_block_mask = torch.compile(create_block_mask, dynamic=False)
+
+
+def _flex_flash_backend_available() -> bool:
+    """FlashAttention-4 (CuTe DSL) backend for FlexAttention: Hopper/Blackwell, forward
+    and backward with block sparsity. Needs `pip install flash-attn-4`. Set
+    ORTHRUS_FLEX_BACKEND=TRITON to force the Triton kernels (e.g. on A100)."""
+    forced = os.environ.get("ORTHRUS_FLEX_BACKEND")
+    if forced:
+        return forced.strip().upper() == "FLASH"
+    return importlib.util.find_spec("flash_attn.cute") is not None
+
+
+_FLEX_BACKEND = "FLASH" if _flex_flash_backend_available() else "TRITON"
+
 
 def fused_flex_attention(q, k, v, mask=None):
-    kernel_options = {"BACKEND": "TRITON"}
     return _compiled_flex_attention(
         q,
         k,
         v,
         block_mask=mask,
         enable_gqa=True,
-        kernel_options=kernel_options,
+        kernel_options={"BACKEND": _FLEX_BACKEND},
     )
     
 def generate_dual_pass_mask(
     B: int,
-    H: int,
+    H: int | None,
     diffusion_length: int,
     ar_len: int,
     block_size: int,
     causal_limit: torch.Tensor,
     sparse_block_size: int = 128,
+    compiled: bool = True,
 ):
+    # `H` is accepted for signature compatibility but deliberately ignored: the mask does
+    # not depend on the head, so it is built once and broadcast (H=None). Building it per
+    # head costs num_heads x more memory/time and disables FA4's GQA packing.
     assert causal_limit is not None, "causal_limit tensor is required for dual-pass diffusion masking"
     if causal_limit.shape[1] != diffusion_length:
         raise ValueError(f"causal_limit shape mismatch: expected second dim={diffusion_length}, got {causal_limit.shape[1]}")
@@ -64,12 +87,14 @@ def generate_dual_pass_mask(
         valid_diffusion = (~is_kv_ar) & (q_block_id == kv_block_id)
         return valid_ar | valid_diffusion
 
-    return create_block_mask(
+    builder = _compiled_create_block_mask if compiled else create_block_mask
+    return builder(
         dual_pass_mask_fn,
         B=B,
-        H=H,
+        H=None,
         Q_LEN=diffusion_length,
         KV_LEN=ar_len + diffusion_length,
+        device=causal_limit.device,
         BLOCK_SIZE=sparse_block_size,
     )
 
@@ -285,7 +310,7 @@ class OrthrusModel(OrthrusPreTrainedModel):
             batch_size, diffusion_length = inputs_embeds.shape[:2]
             flex_block_mask = generate_dual_pass_mask(
                 B=batch_size,
-                H=self.config.num_attention_heads,
+                H=None,
                 diffusion_length=diffusion_length,
                 ar_len=ar_seq_len,
                 block_size=self.config.block_size,

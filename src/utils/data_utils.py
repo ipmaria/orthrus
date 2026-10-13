@@ -78,7 +78,6 @@ def create_packed_dataloader(
 def assistant_token_mask(input_ids: list[int], tokenizer: Any) -> list[int]:
     im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
     im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    think_close = tokenizer.convert_tokens_to_ids("</think>")
     assistant_ids = tokenizer.encode("assistant", add_special_tokens=False)
     if len(assistant_ids) != 1:
         raise ValueError(f"`assistant` is not a single token: {assistant_ids}")
@@ -101,19 +100,8 @@ def assistant_token_mask(input_ids: list[int], tokenizer: Any) -> list[int]:
         if content_start < num_tokens and input_ids[content_start] not in (im_start, im_end):
             content_start += 1  # the newline after the role name
 
-        # Skip a reasoning block if present
-        think_close_at = None
-        for scan in range(content_start, num_tokens):
-            if input_ids[scan] == im_end:
-                break
-            if input_ids[scan] == think_close:
-                think_close_at = scan
-                break
-        if think_close_at is not None:
-            content_start = think_close_at + 1
-            if content_start < num_tokens and input_ids[content_start] not in (im_start, im_end):
-                content_start += 1
-
+        # Thinking mode: the whole turn is supervised, <think>...</think> included. The
+        # drafter has to propose reasoning tokens at inference, so it must train on them.
         cursor = content_start
         while cursor < num_tokens and input_ids[cursor] != im_end:
             mask[cursor] = 1
@@ -135,7 +123,12 @@ def build_packed_cache(
     shuffle: bool = True,
     seed: int = 42,
 ):
-    """`messages` rows -> tokenized + `assistant_mask` -> packed fixed-length rows."""
+    """`messages` rows -> tokenized + `assistant_mask` -> packed fixed-length rows.
+
+    Legacy text path: re-tokenizes through the chat template and slices the token stream
+    without regard to conversation boundaries. For on-policy data prefer
+    scripts/build_packed_cache_ids.py, which packs the exact generated token ids.
+    """
     if os.path.isdir(dataset_path):
         raw = datasets.load_from_disk(dataset_path)
     else:

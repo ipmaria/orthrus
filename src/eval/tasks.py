@@ -240,25 +240,25 @@ TASKS: dict[str, Task] = {
         name="gsm8k",
         hf_path="openai/gsm8k", hf_config="main", split="test",
         build_prompt=lambda row: f"{MATH_INSTRUCTION}\n\n{row['question']}",
-        gold=_gsm8k_gold, kind="math", max_new_tokens=1024,
+        gold=_gsm8k_gold, kind="math", max_new_tokens=4096,
     ),
     "math500": Task(
         name="math500",
         hf_path="HuggingFaceH4/MATH-500", hf_config=None, split="test",
         build_prompt=lambda row: f"{MATH_INSTRUCTION}\n\n{row['problem']}",
-        gold=lambda row: str(row["answer"]), kind="math", max_new_tokens=2048,
+        gold=lambda row: str(row["answer"]), kind="math", max_new_tokens=8192,
     ),
     "aime24": Task(
         name="aime24",
         hf_path="HuggingFaceH4/aime_2024", hf_config=None, split="train",
         build_prompt=lambda row: f"{MATH_INSTRUCTION}\n\n{row['problem']}",
-        gold=lambda row: str(row["answer"]), kind="math", max_new_tokens=4096,
+        gold=lambda row: str(row["answer"]), kind="math", max_new_tokens=16384,
     ),
     "aime25": Task(
         name="aime25",
         hf_path="yentinglin/aime_2025", hf_config=None, split="train",
         build_prompt=lambda row: f"{MATH_INSTRUCTION}\n\n{row['problem']}",
-        gold=lambda row: str(row["answer"]), kind="math", max_new_tokens=4096,
+        gold=lambda row: str(row["answer"]), kind="math", max_new_tokens=16384,
     ),
     "humaneval": Task(
         name="humaneval",
@@ -267,7 +267,7 @@ TASKS: dict[str, Task] = {
             "Complete the following Python function. Return the full function in a "
             f"```python code block.\n\n```python\n{row['prompt']}```"
         ),
-        gold=lambda row: row["entry_point"], kind="code", max_new_tokens=1024,
+        gold=lambda row: row["entry_point"], kind="code", max_new_tokens=4096,
         entry_point=lambda row: row["entry_point"],
         test_program=_humaneval_program,
     ),
@@ -279,7 +279,7 @@ TASKS: dict[str, Task] = {
             f"satisfy these tests:\n" + "\n".join(row["test_list"]) +
             "\n\nReturn the complete solution in a ```python code block."
         ),
-        gold=lambda row: "\n".join(row["test_list"]), kind="code", max_new_tokens=1024,
+        gold=lambda row: "\n".join(row["test_list"]), kind="code", max_new_tokens=4096,
         test_program=_mbpp_program,
     ),
     # Table 1's last two rows. Efficiency-only -- see the module docstring.
@@ -289,13 +289,13 @@ TASKS: dict[str, Task] = {
         # which. 2k is the default; `--hf-config pseudo_to_code_0.5k` selects the other.
         hf_path="PrincetonPLI/LongProc", hf_config="pseudo_to_code_2k", split="test",
         build_prompt=_pseudo2code_prompt,
-        gold=lambda row: row["reference_output"], kind="generation", max_new_tokens=4096,
+        gold=lambda row: row["reference_output"], kind="generation", max_new_tokens=8192,
     ),
     "livecodebench_v5": Task(
         name="livecodebench_v5",
         hf_path=LCB_REPO, hf_config="release_v5", split="test",
         build_prompt=_lcb_prompt,
-        gold=lambda row: row["question_id"], kind="generation", max_new_tokens=2048,
+        gold=lambda row: row["question_id"], kind="generation", max_new_tokens=8192,
         load_rows=_lcb_load_rows,
     ),
 }

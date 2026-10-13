@@ -178,13 +178,17 @@ def parse_args():
     p.add_argument("--limit", type=int, default=None, help="Cap examples per task.")
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="Override the per-task default.")
-    p.add_argument("--temperature", type=float, default=0.0,
-                   help="0 = greedy (Table 1 T=0 column and the losslessness check).")
+    p.add_argument("--temperature", type=float, default=0.6,
+                   help="Qwen3 thinking-mode default is 0.6. 0 = greedy: enables the "
+                        "losslessness check, but thinking traces loop under greedy "
+                        "decoding, which inflates TPF -- use it with --limit as a sanity "
+                        "check only.")
     p.add_argument("--top-k", type=int, default=20)
-    p.add_argument("--top-p", type=float, default=0.8)
+    p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--block-size", type=int, default=None,
                    help="Override K at inference (Section 5 ablation).")
-    p.add_argument("--enable-thinking", action="store_true")
+    p.add_argument("--no-thinking", dest="enable_thinking", action="store_false",
+                   help="Thinking mode is the default; this disables it.")
     p.add_argument("--no-baseline", action="store_true",
                    help="Skip the AR run (no speedup or losslessness numbers).")
     p.add_argument("--allow-code-execution", action="store_true",

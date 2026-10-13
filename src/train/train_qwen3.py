@@ -1,8 +1,16 @@
 """Train the Orthrus diffusion view on a frozen Qwen3 backbone (paper 3.2 / Eq. 7).
 
+    # one GPU, thinking-mode on-policy cache from scripts/build_packed_cache_ids.py
+    python -m src.train.train_qwen3 \
+      --model-dir pretrained-models/orthrus-qwen3-0.6b-init \
+      --packed-cache-path data/processed/orthrus-onpolicy-4096 --seq-len 4096 \
+      --output-dir checkpoints/orthrus-qwen3-0.6b-think
+
+    # 8 GPUs, paper scale
     torchrun --nproc_per_node=8 -m src.train.train_qwen3 \
       --model-dir pretrained-models/orthrus-qwen3-8b-init \
-      --packed-cache-path data/processed/orthrus-packed-2048-asst \
+      --packed-cache-path data/processed/orthrus-onpolicy-4096 --seq-len 4096 \
+      --micro-batch-size 1 --grad-accum-steps 16 \
       --output-dir checkpoints/orthrus-qwen3-8b --fsdp2 --activation-checkpointing
 
 Companion to the official `src/train/train.py`, which trains the Qwen3.5 hybrid
@@ -13,9 +21,10 @@ backbone with hard-label cross-entropy. Two differences, both deliberate:
   * `--objective kl` (default) minimises the forward KL against the frozen AR head
     (Eq. 7). `--objective ce` reproduces the Table 5 ablation arm.
 
-Defaults follow Table 4 (L=2048, 256 anchors, K=32, 2 epochs, lr 2e-4, warmup 0.05,
-micro-batch 1 x grad-accum 16 x 8 ranks = global batch 128), not the official script's
-smoke-run defaults.
+Defaults follow Table 4 (256 anchors, K=32, 2 epochs, lr 2e-4, warmup 0.05, global batch
+128) with two deliberate departures for thinking-mode data: L=4096 instead of 2048, so a
+prompt plus a reasoning trace fits one row, and micro-batch 2 x grad-accum 64 so the
+global batch of 128 is reached on ONE GPU (multiply by world_size otherwise).
 """
 
 from __future__ import annotations
@@ -410,9 +419,10 @@ def parse_args():
     p.add_argument("--auto-resume", action="store_true",
                    help="Resume from the newest step-* in --output-dir (for preempted jobs).")
     p.add_argument("--keep-last-checkpoints", type=int, default=5)
-    p.add_argument("--attn-implementation", type=str, default="flash_attention_2",
+    p.add_argument("--attn-implementation", type=str, default="sdpa",
                    choices=["flash_attention_2", "flash_attention_3", "sdpa", "eager"],
-                   help="For the AR pass only; the diffusion pass always uses FlexAttention. "
+                   help="For the AR pass only (dense causal, a few %% of the step, so sdpa "
+                        "is fine); the diffusion pass always uses FlexAttention. "
                         "Unlike the Qwen3.5 stack, sdpa/eager are correct here too -- "
                         "OrthrusModel.forward builds a real causal mask for them.")
     # Objective
@@ -423,9 +433,12 @@ def parse_args():
                    help="Positions per recomputed logit chunk. Peak activation memory is "
                         "~4 x chunk x vocab x 4B; lower it if the loss OOMs.")
     # Training (defaults = paper Table 4)
-    p.add_argument("--seq-len", type=int, default=2048)
-    p.add_argument("--micro-batch-size", type=int, default=1)
-    p.add_argument("--grad-accum-steps", type=int, default=16)
+    p.add_argument("--seq-len", type=int, default=4096,
+                   help="Must match the packed cache. 4096 fits prompt + a thinking trace.")
+    p.add_argument("--micro-batch-size", type=int, default=2)
+    p.add_argument("--grad-accum-steps", type=int, default=64,
+                   help="global batch = micro_batch x grad_accum x world_size; the defaults "
+                        "give the paper's 128 on a single GPU.")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--max-steps", type=int, default=0, help="0 = run full epochs")
     p.add_argument("--num-anchor-blocks", type=int, default=256)

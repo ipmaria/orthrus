@@ -32,10 +32,13 @@ def load_model(model_dir: str, dtype: str = "bfloat16", attn_implementation: str
     return model, tokenizer
 
 
-def build_input_ids(tokenizer, prompt: str, enable_thinking: bool = False,
+def build_input_ids(tokenizer, prompt: str, enable_thinking: bool = True,
                     system_prompt: str = "") -> torch.Tensor:
-    messages = [{"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}]
+    # No empty system turn: the on-policy training data (generate_onpolicy.py) carries a
+    # system message only when the source prompt had one, and the drafter should see the
+    # same prefix format at eval time.
+    messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + \
+               [{"role": "user", "content": prompt}]
     encoded = tokenizer.apply_chat_template(
         messages, return_tensors="pt", add_generation_prompt=True,
         enable_thinking=enable_thinking,
