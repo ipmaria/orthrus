@@ -14,5 +14,5 @@ slurm-logs/
 .venv-apptainer/
 =2.10.0
 src/model.py.before-a100
-training-code/*
+training-code/
 results/
