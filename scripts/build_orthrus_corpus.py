@@ -1,22 +1,18 @@
-"""Build the prompt corpus (paper Appendix A): domain-balanced `messages` rows from
-Nemotron-Post-Training-Dataset-v2.
+"""Build the prompt corpus from Nemotron-Post-Training-Dataset-v2 (paper Appendix A).
 
 The dataset's domains ARE its splits (`math`, `code`, `stem`, `chat`, `multilingual_*`);
-there is no `train` split and no category column to classify. Each domain is loaded as
-its own split, prompts are de-duplicated, Nemotron's reasoning-control system prompts
-("/think", "/no_think", "detailed thinking on|off") are dropped, and the three domains
-are truncated to the same size (1:1:1, as in the paper).
+there is no `train` split. Each domain split is read in full from the local cache,
+prompts are de-duplicated (the same question often appears with a reasoning-on and a
+reasoning-off response), Nemotron's reasoning-control system prompts ("/think",
+"/no_think", "detailed thinking on|off") are dropped, and everything is written out.
 
     python scripts/build_orthrus_corpus.py --inspect
-    python scripts/build_orthrus_corpus.py --out data/orthrus-sft.jsonl --per-domain 200000
+    python scripts/build_orthrus_corpus.py --out data/orthrus-sft.jsonl             # all prompts
+    python scripts/build_orthrus_corpus.py --out data/orthrus-sft.jsonl --per-domain 50000 --balance
 
-Only the prompt (system + first user turn) is written by default: on-policy generation
-(scripts/generate_onpolicy.py) regenerates the response anyway, and Nemotron's responses
-make the `chat` split ~6 GB. `--keep-responses` writes full conversations instead.
-
-The `code` split has 175,000 rows, so the paper's 200K per domain is not reachable for
-code; the 1:1:1 balance then caps every domain at what survives de-duplication there.
-`--split-map chat=chat,stem` folds the STEM split into the chat bucket if you want more.
+Only the prompt (system + first user turn) is written: on-policy generation regenerates
+the response anyway, and Nemotron's responses make the `chat` split ~6 GB.
+`--keep-responses` writes full conversations instead.
 """
 
 from __future__ import annotations
@@ -44,9 +40,14 @@ def parse_split_map(spec: str) -> dict[str, list[str]]:
     return out
 
 
-def prompt_of(row) -> list | None:
-    """system (optional, control strings dropped) + first user turn."""
-    messages = row.get("messages")
+def clean_system(content: str) -> str | None:
+    if CONTROL_RE.search(content):
+        content = CONTROL_RE.sub("", content).strip()
+    return content if content.strip() else None
+
+
+def prompt_of(messages) -> list | None:
+    """system (optional, control strings dropped, empty dropped) + first user turn."""
     if not isinstance(messages, list):
         return None
     out = []
@@ -55,8 +56,7 @@ def prompt_of(row) -> list | None:
         if not isinstance(content, str):
             return None
         if role == "system" and not out:
-            if CONTROL_RE.search(content):
-                content = CONTROL_RE.sub("", content).strip()
+            content = clean_system(content)
             if content:
                 out.append({"role": "system", "content": content})
         elif role == "user":
@@ -69,20 +69,21 @@ def prompt_of(row) -> list | None:
     return None
 
 
-def full_conversation(row) -> list | None:
-    messages = row.get("messages")
+def full_conversation(messages) -> list | None:
     if not isinstance(messages, list):
         return None
     cleaned = []
     for m in messages:
         role, content = m.get("role"), m.get("content")
-        if role and isinstance(content, str) and content.strip():
-            if role == "system" and CONTROL_RE.search(content):
-                content = CONTROL_RE.sub("", content).strip()
-                if not content:
-                    continue
-            cleaned.append({"role": role, "content": content})
-    return cleaned if len(cleaned) >= 2 and cleaned[0]["role"] in ("system", "user") else None
+        if not role or not isinstance(content, str) or not content.strip():
+            continue
+        if role == "system":
+            content = clean_system(content)
+            if not content:
+                continue
+        cleaned.append({"role": role, "content": content})
+    ok = len(cleaned) >= 2 and cleaned[0]["role"] in ("system", "user")
+    return cleaned if ok else None
 
 
 def prompt_key(messages: list) -> str:
@@ -96,34 +97,27 @@ def parse_args():
     p.add_argument("--split-map", type=str, default=DEFAULT_SPLIT_MAP,
                    help='"domain=split[,split...] ..." e.g. "math=math code=code chat=chat,stem"')
     p.add_argument("--out", type=str, default=None, help="Output JSONL (messages rows).")
-    p.add_argument("--per-domain", type=int, default=200_000,
-                   help="Conversations per domain; the smallest domain caps the others (1:1:1).")
-    p.add_argument("--no-balance", action="store_true",
-                   help="Keep every domain at min(--per-domain, available) instead of 1:1:1.")
+    p.add_argument("--per-domain", type=int, default=0,
+                   help="Cap per domain (random subset after de-duplication). 0 = take all.")
+    p.add_argument("--balance", action="store_true",
+                   help="Truncate every domain to the smallest one (paper's 1:1:1).")
     p.add_argument("--keep-responses", action="store_true",
                    help="Write full conversations instead of prompts only.")
     p.add_argument("--inspect", action="store_true",
-                   help="Print splits, columns and a few stats, then exit.")
-    p.add_argument("--inspect-rows", type=int, default=2000)
+                   help="Print splits, columns and stats on a random sample, then exit.")
+    p.add_argument("--inspect-rows", type=int, default=5000)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--streaming", action="store_true",
-                   help="Stream the parquet shards instead of materialising the splits "
-                        "(no multi-GB download; recommended on a first run).")
     args = p.parse_args()
     if not args.inspect and not args.out:
         raise ValueError("--out is required unless --inspect is passed.")
     return args
 
 
-def load_split(source: str, split: str, streaming: bool):
-    import datasets
-    return datasets.load_dataset(source, split=split, streaming=streaming)
-
-
 def main():
     args = parse_args()
     import datasets
 
+    rng = random.Random(args.seed)
     split_map = parse_split_map(args.split_map)
     available = datasets.get_dataset_split_names(args.source)
     print(f"source={args.source} splits={available}")
@@ -134,29 +128,32 @@ def main():
     if args.inspect:
         for domain, splits in split_map.items():
             for split in splits:
-                ds = load_split(args.source, split, streaming=True)
-                head = list(ds.take(args.inspect_rows))
-                columns = sorted({k for row in head for k in row})
-                reasoning = Counter(str(r.get("reasoning")) for r in head)
-                with_system = sum(1 for r in head if r["messages"] and r["messages"][0]["role"] == "system")
-                control = sum(1 for r in head if r["messages"] and r["messages"][0]["role"] == "system"
-                              and CONTROL_RE.search(r["messages"][0]["content"] or ""))
-                turns = Counter(sum(1 for m in r["messages"] if m["role"] == "user") for r in head)
-                print(f"\n[{domain}] split={split} columns={columns}")
-                print(f"  reasoning={dict(reasoning)} | rows with system prompt={with_system} "
-                      f"(with Nemotron control string: {control}) | user turns={dict(turns)}")
-                example = next((prompt_of(r) for r in head if prompt_of(r)), None)
+                ds = datasets.load_dataset(args.source, split=split)
+                idx = rng.sample(range(len(ds)), min(args.inspect_rows, len(ds)))
+                sample = ds.select(idx)
+                reasoning = Counter(str(r.get("reasoning")) for r in sample)
+                systems = [r["messages"][0]["content"] or "" for r in sample
+                           if r["messages"] and r["messages"][0]["role"] == "system"]
+                empty_sys = sum(1 for c in systems if not c.strip())
+                control = sum(1 for c in systems if CONTROL_RE.search(c))
+                turns = Counter(sum(1 for m in r["messages"] if m["role"] == "user") for r in sample)
+                example = next((prompt_of(r["messages"]) for r in sample if prompt_of(r["messages"])), None)
+                print(f"\n[{domain}] split={split} rows={len(ds):,} columns={ds.column_names} "
+                      f"(random sample of {len(sample)})")
+                print(f"  reasoning={dict(reasoning)} | system prompts: {len(systems)} total, "
+                      f"{empty_sys} empty (dropped), {control} with Nemotron control string "
+                      f"(stripped) | user turns={dict(turns)}")
                 print(f"  example prompt: {json.dumps(example, ensure_ascii=False)[:300]}")
         return
 
-    rng = random.Random(args.seed)
     buckets: dict[str, list] = {}
     for domain, splits in split_map.items():
         seen, rows, dupes, bad = set(), [], 0, 0
         for split in splits:
-            ds = load_split(args.source, split, streaming=args.streaming)
-            for row in ds:
-                msgs = full_conversation(row) if args.keep_responses else prompt_of(row)
+            ds = datasets.load_dataset(args.source, split=split).select_columns(["messages"])
+            for row in ds:  # full pass over the split
+                msgs = full_conversation(row["messages"]) if args.keep_responses \
+                    else prompt_of(row["messages"])
                 if msgs is None:
                     bad += 1
                     continue
@@ -166,32 +163,23 @@ def main():
                     continue
                 seen.add(key)
                 rows.append(msgs)
-                if len(rows) >= args.per_domain:
-                    break
-            if len(rows) >= args.per_domain:
-                break
-        rng.shuffle(rows)
+        print(f"[{domain}] unique prompts={len(rows):,} duplicates={dupes:,} "
+              f"malformed={bad:,} (splits={splits})")
+        if args.per_domain and len(rows) > args.per_domain:
+            rows = rng.sample(rows, args.per_domain)
         buckets[domain] = rows
-        print(f"[{domain}] kept={len(rows):,} duplicates={dupes:,} malformed={bad:,} "
-              f"(splits={splits})")
 
-    if args.no_balance:
-        sizes = {d: len(r) for d, r in buckets.items()}
-    else:
+    if args.balance:
         n = min(len(r) for r in buckets.values())
-        sizes = {d: n for d in buckets}
-        if n < args.per_domain:
-            print(f"NOTE: smallest domain has {n:,}; all domains truncated to that for 1:1:1.")
+        buckets = {d: rng.sample(r, n) for d, r in buckets.items()}
 
-    out_rows = []
-    for domain, rows in buckets.items():
-        out_rows.extend({"messages": m, "domain": domain} for m in rows[:sizes[domain]])
+    out_rows = [{"messages": m, "domain": d} for d, rows in buckets.items() for m in rows]
     rng.shuffle(out_rows)
     with open(args.out, "w") as handle:
         for r in out_rows:
             handle.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"wrote {len(out_rows):,} prompts to {args.out} "
-          f"({', '.join(f'{d}={n:,}' for d, n in sizes.items())})")
+    sizes = ", ".join(f"{d}={len(r):,}" for d, r in buckets.items())
+    print(f"wrote {len(out_rows):,} prompts to {args.out} ({sizes})")
     print(f"\nNext: python scripts/generate_onpolicy.py --in {args.out} "
           f"--out data/orthrus-onpolicy-think.jsonl --model Qwen/Qwen3-0.6B")
 
