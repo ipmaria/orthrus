@@ -15,6 +15,14 @@ prefixes, supervises the whole <think>...answer span, conversation-aligned rows)
 
 Sampling defaults are Qwen3's thinking-mode recommendation (T=0.6, top_p=0.95, top_k=20).
 Qwen advises against greedy decoding in thinking mode (repetition loops).
+
+Generation is embarrassingly parallel: `--num-shards N --shard-id k` makes this process
+take every N-th prompt (deterministic), so N copies on N GPUs (any GPU with >=16 GB works
+for a 0.6B model) write N files `<out>.k-of-N`, to be concatenated afterwards:
+
+    for i in 0 1 2 3; do CUDA_VISIBLE_DEVICES=$i python scripts/generate_onpolicy.py \
+        --in data/orthrus-sft.jsonl --out data/think.jsonl --num-shards 4 --shard-id $i & done; wait
+    cat data/think.jsonl.*-of-4 > data/orthrus-onpolicy-think.jsonl
 """
 
 from __future__ import annotations
@@ -32,6 +40,11 @@ def parse_args():
     p.add_argument("--out", required=True, help="Output JSONL.")
     p.add_argument("--model", default="Qwen/Qwen3-0.6B",
                    help="Base model: must be the one the Orthrus init copies.")
+    p.add_argument("--samples-per-prompt", nargs="+", default=["1"],
+                   help='Responses sampled per prompt: a default and per-domain overrides, '
+                        'e.g. "1 code=3" (the corpus JSONL carries a `domain` field). '
+                        'Nemotron ships ~5 responses per code problem but only ~34K unique '
+                        'code prompts; several on-policy traces per prompt restore the volume.')
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=20)
@@ -50,8 +63,26 @@ def parse_args():
     p.add_argument("--batch", type=int, default=8192, help="Prompts per vLLM call.")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    p.add_argument("--kv-cache-dtype", default="auto", choices=["auto", "fp8"],
+                   help="fp8 KV cache roughly doubles decode throughput on Hopper (decode "
+                        "is KV-bandwidth bound) at the price of a slight shift of the "
+                        "sampled trajectories away from the exact bf16 model.")
+    p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--shard-id", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+    args = p.parse_args()
+    args.n_default, args.n_by_domain = 1, {}
+    for item in args.samples_per_prompt:
+        if "=" in item:
+            d, k = item.split("=", 1)
+            args.n_by_domain[d] = int(k)
+        else:
+            args.n_default = int(item)
+    if not 0 <= args.shard_id < args.num_shards:
+        raise ValueError("--shard-id must be in [0, --num-shards).")
+    if args.num_shards > 1:
+        args.out = f"{args.out}.{args.shard_id}-of-{args.num_shards}"
+    return args
 
 
 def prompt_messages(messages: list) -> list | None:
@@ -85,11 +116,14 @@ def main():
     stop_ids = {tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.eos_token_id}
     prompt_budget = args.max_model_len - args.max_tokens
 
-    rows, prompt_ids = [], []
+    rows, prompt_ids, n_samples = [], [], []
     skipped_long = 0
     with open(args.inp) as f:
-        for line in f:
-            msgs = prompt_messages(json.loads(line).get("messages", []))
+        for line_no, line in enumerate(f):
+            if line_no % args.num_shards != args.shard_id:
+                continue
+            rec = json.loads(line)
+            msgs = prompt_messages(rec.get("messages", []))
             if msgs is None:
                 continue
             # Exact prompt tokens; the same template call the eval harness makes.
@@ -102,52 +136,59 @@ def main():
                 continue
             rows.append(msgs)
             prompt_ids.append(list(ids))
+            n_samples.append(args.n_by_domain.get(rec.get("domain"), args.n_default))
             if args.limit and len(rows) >= args.limit:
                 break
-    print(f"prompts: {len(rows):,} (skipped {skipped_long:,} longer than "
-          f"{prompt_budget} tokens)", file=sys.stderr)
+    print(f"prompts: {len(rows):,} -> {sum(n_samples):,} samples (skipped {skipped_long:,} "
+          f"prompts longer than {prompt_budget} tokens)", file=sys.stderr)
 
     llm = LLM(model=args.model, dtype="bfloat16", max_model_len=args.max_model_len,
               gpu_memory_utilization=args.gpu_memory_utilization,
-              enable_prefix_caching=True, seed=args.seed)
-    sp = SamplingParams(temperature=args.temperature, top_p=args.top_p,
-                        top_k=args.top_k, max_tokens=args.max_tokens, seed=args.seed)
+              kv_cache_dtype=args.kv_cache_dtype,
+              enable_prefix_caching=True, seed=args.seed + args.shard_id)
+    def sampling(n):
+        return SamplingParams(n=n, temperature=args.temperature, top_p=args.top_p,
+                              top_k=args.top_k, max_tokens=args.max_tokens,
+                              seed=args.seed + args.shard_id)
+    sp_cache = {n: sampling(n) for n in set(n_samples)}
 
     kept = dropped_trunc = dropped_rep = n_trunc = 0
     with open(args.out, "w") as out:
         for start in range(0, len(rows), args.batch):
             batch_ids = prompt_ids[start:start + args.batch]
-            outs = llm.generate([{"prompt_token_ids": ids} for ids in batch_ids], sp)
+            batch_sp = [sp_cache[n] for n in n_samples[start:start + args.batch]]
+            outs = llm.generate([{"prompt_token_ids": ids} for ids in batch_ids], batch_sp)
             for msgs, ids, o in zip(rows[start:start + args.batch], batch_ids, outs):
-                c = o.outputs[0]
-                text = c.text.strip()
-                if not text:
-                    continue
-                finished = c.finish_reason == "stop"
-                if not finished:
-                    n_trunc += 1
-                    if args.drop_truncated:
-                        dropped_trunc += 1
+                for c in o.outputs:  # n samples of this prompt
+                    text = c.text.strip()
+                    if not text:
                         continue
-                if args.min_distinct_ngram > 0 and \
-                        distinct_ngram_ratio(text) < args.min_distinct_ngram:
-                    dropped_rep += 1
-                    continue
-                resp = [int(t) for t in c.token_ids]
-                while resp and resp[-1] in stop_ids:  # the packer re-adds <|im_end|>
-                    resp.pop()
-                out.write(json.dumps({
-                    "messages": msgs + [{"role": "assistant", "content": text}],
-                    "prompt_ids": ids,
-                    "response_ids": resp,
-                    "finished": finished,
-                }, ensure_ascii=False) + "\n")
-                kept += 1
+                    finished = c.finish_reason == "stop"
+                    if not finished:
+                        n_trunc += 1
+                        if args.drop_truncated:
+                            dropped_trunc += 1
+                            continue
+                    if args.min_distinct_ngram > 0 and \
+                            distinct_ngram_ratio(text) < args.min_distinct_ngram:
+                        dropped_rep += 1
+                        continue
+                    resp = [int(t) for t in c.token_ids]
+                    while resp and resp[-1] in stop_ids:  # the packer re-adds <|im_end|>
+                        resp.pop()
+                    out.write(json.dumps({
+                        "messages": msgs + [{"role": "assistant", "content": text}],
+                        "prompt_ids": ids,
+                        "response_ids": resp,
+                        "finished": finished,
+                    }, ensure_ascii=False) + "\n")
+                    kept += 1
             print(f"{min(start + args.batch, len(rows)):,}/{len(rows):,} kept={kept:,} "
                   f"truncated={n_trunc:,} (dropped {dropped_trunc:,}) "
                   f"repetitive={dropped_rep:,}", file=sys.stderr)
 
     print(f"wrote {kept:,} on-policy samples to {args.out}\n"
+          + ("(concatenate all shards before packing)\n" if args.num_shards > 1 else "") +
           f"Next:\n  python scripts/build_packed_cache_ids.py --dataset-path {args.out} "
           f"--out data/processed/orthrus-onpolicy-{args.max_model_len} "
           f"--model-dir pretrained-models/orthrus-qwen3-0.6b-init "

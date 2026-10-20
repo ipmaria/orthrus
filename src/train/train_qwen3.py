@@ -196,6 +196,22 @@ def train(args):
         copy_diff_from_ar(model)
         log_main(is_main, "Warm-started diffusion twins from frozen AR weights.")
     n_train, n_total = freeze_to_diffusion(model)
+    if args.fp32_master and not args.fsdp2:
+        # fp32 master weights for the trainable projections. Forward/backward still run in
+        # bf16: under autocast F.linear casts the weight on the fly (cached per autocast
+        # region), while the weight itself, its gradient and its Adam moments live in
+        # fp32, so updates below bf16 resolution (~0.4% of the weight) are no longer
+        # rounded away. ~12 bytes/param extra: about 1.5 GB for the 0.6B twins. 1-D norm
+        # weights stay bf16 so q/k activations keep their dtype for FlexAttention. With
+        # --fsdp2 the equivalent is loading the whole model in fp32 and letting the
+        # MixedPrecisionPolicy cast (FSDP2 wants one dtype per sharded group).
+        n_master = 0
+        for param in model.parameters():
+            if param.requires_grad and param.dim() == 2:
+                param.data = param.data.float()
+                n_master += param.numel()
+        log_main(is_main, f"fp32 master weights for {format_human_count(n_master)} "
+                          f"trainable params (bf16 compute via autocast).")
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(
         param.numel() for param in model.parameters() if param.requires_grad
@@ -435,7 +451,7 @@ def parse_args():
     # Training (defaults = paper Table 4)
     p.add_argument("--seq-len", type=int, default=4096,
                    help="Must match the packed cache. 4096 fits prompt + a thinking trace.")
-    p.add_argument("--micro-batch-size", type=int, default=2)
+    p.add_argument("--micro-batch-size", type=int, default=4)
     p.add_argument("--grad-accum-steps", type=int, default=64,
                    help="global batch = micro_batch x grad_accum x world_size; the defaults "
                         "give the paper's 128 on a single GPU.")
@@ -445,6 +461,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--fp32-master", action=argparse.BooleanOptionalAction, default=True,
+                   help="Keep trainable projection weights and Adam moments in fp32 "
+                        "(compute stays bf16). --no-fp32-master = the paper's pure-bf16 setup.")
     p.add_argument("--max-grad-norm", type=float, default=1.0, help="0 disables clipping.")
     p.add_argument("--dtype", type=str, default="bfloat16",
                    choices=["float32", "float16", "bfloat16"])
