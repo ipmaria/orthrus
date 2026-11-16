@@ -43,6 +43,7 @@ def parse_args():
     p.add_argument("--samples-per-prompt", nargs="+", default=["1"],
                    help='Responses sampled per prompt: a default and per-domain overrides, '
                         'e.g. "1 code=3" (the corpus JSONL carries a `domain` field). '
+                        'A row may also carry its own "n" field, which wins over both. '
                         'Nemotron ships ~5 responses per code problem but only ~34K unique '
                         'code prompts; several on-policy traces per prompt restore the volume.')
     p.add_argument("--temperature", type=float, default=0.6)
@@ -52,8 +53,11 @@ def parse_args():
                    help="Reasoning traces beyond this are kept as prefixes (still "
                         "on-policy) unless --drop-truncated.")
     p.add_argument("--max-model-len", type=int, default=4096,
-                   help="prompt budget = max-model-len - max-tokens; longer prompts are "
-                        "skipped. Match --seq-len of the packer.")
+                   help="Prompt + response budget per sample; match --seq-len of the packer "
+                        "(anything longer would be cut to a prefix when packing anyway). "
+                        "Each request gets max_tokens = min(--max-tokens, budget - prompt).")
+    p.add_argument("--min-response-tokens", type=int, default=256,
+                   help="Skip prompts that leave less room than this for the response.")
     p.add_argument("--drop-truncated", action="store_true",
                    help="Drop responses cut by --max-tokens. Required only for the legacy "
                         "text packer (the chat template cannot render an unclosed <think>).")
@@ -114,9 +118,8 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     stop_ids = {tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.eos_token_id}
-    prompt_budget = args.max_model_len - args.max_tokens
 
-    rows, prompt_ids, n_samples = [], [], []
+    rows, prompt_ids, n_samples, max_toks = [], [], [], []
     skipped_long = 0
     with open(args.inp) as f:
         for line_no, line in enumerate(f):
@@ -131,32 +134,42 @@ def main():
                 msgs, tokenize=True, return_dict=True, add_generation_prompt=True,
                 enable_thinking=True,
             )["input_ids"]
-            if len(ids) > prompt_budget:
+            room = args.max_model_len - len(ids)
+            if room < args.min_response_tokens:
                 skipped_long += 1
                 continue
             rows.append(msgs)
             prompt_ids.append(list(ids))
-            n_samples.append(args.n_by_domain.get(rec.get("domain"), args.n_default))
+            n_samples.append(int(rec["n"]) if rec.get("n") else
+                             args.n_by_domain.get(rec.get("domain"), args.n_default))
+            max_toks.append(min(args.max_tokens, room))
             if args.limit and len(rows) >= args.limit:
                 break
     print(f"prompts: {len(rows):,} -> {sum(n_samples):,} samples (skipped {skipped_long:,} "
-          f"prompts longer than {prompt_budget} tokens)", file=sys.stderr)
+          f"prompts leaving < {args.min_response_tokens} tokens for the response; "
+          f"{sum(m < args.max_tokens for m in max_toks):,} get a reduced response budget)",
+          file=sys.stderr)
 
     llm = LLM(model=args.model, dtype="bfloat16", max_model_len=args.max_model_len,
               gpu_memory_utilization=args.gpu_memory_utilization,
               kv_cache_dtype=args.kv_cache_dtype,
               enable_prefix_caching=True, seed=args.seed + args.shard_id)
-    def sampling(n):
-        return SamplingParams(n=n, temperature=args.temperature, top_p=args.top_p,
-                              top_k=args.top_k, max_tokens=args.max_tokens,
-                              seed=args.seed + args.shard_id)
-    sp_cache = {n: sampling(n) for n in set(n_samples)}
+    sp_cache = {}
+
+    def sampling(n, max_tokens):
+        key = (n, max_tokens)
+        if key not in sp_cache:
+            sp_cache[key] = SamplingParams(n=n, temperature=args.temperature, top_p=args.top_p,
+                                           top_k=args.top_k, max_tokens=max_tokens,
+                                           seed=args.seed + args.shard_id)
+        return sp_cache[key]
 
     kept = dropped_trunc = dropped_rep = n_trunc = 0
     with open(args.out, "w") as out:
         for start in range(0, len(rows), args.batch):
             batch_ids = prompt_ids[start:start + args.batch]
-            batch_sp = [sp_cache[n] for n in n_samples[start:start + args.batch]]
+            batch_sp = [sampling(n, m) for n, m in zip(n_samples[start:start + args.batch],
+                                                        max_toks[start:start + args.batch])]
             outs = llm.generate([{"prompt_token_ids": ids} for ids in batch_ids], batch_sp)
             for msgs, ids, o in zip(rows[start:start + args.batch], batch_ids, outs):
                 for c in o.outputs:  # n samples of this prompt

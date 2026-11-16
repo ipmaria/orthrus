@@ -455,7 +455,7 @@ def parse_args():
     p.add_argument("--grad-accum-steps", type=int, default=64,
                    help="global batch = micro_batch x grad_accum x world_size; the defaults "
                         "give the paper's 128 on a single GPU.")
-    p.add_argument("--epochs", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--max-steps", type=int, default=0, help="0 = run full epochs")
     p.add_argument("--num-anchor-blocks", type=int, default=256)
     p.add_argument("--lr", type=float, default=2e-4)
