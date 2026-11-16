@@ -25,7 +25,7 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" slurm-logs
 MODEL_DIR="${MODEL_DIR:-pretrained-models/orthrus-qwen3-8b-init}"
 CACHE_PATH="${CACHE_PATH:-data/processed/orthrus-packed-2048-asst}"
 OUT_DIR="${OUT_DIR:-checkpoints/orthrus-qwen3-8b}"
-OBJECTIVE="${OBJECTIVE:-kl}"   # `ce` reproduces the Table 5 ablation arm
+OBJECTIVE="${OBJECTIVE:-kl}"   # `ce`: Table 5; `accepted-length`: stage 2 from a CE/KL checkpoint
 
 echo "node=$(hostname) model=$MODEL_DIR objective=$OBJECTIVE out=$OUT_DIR"
 

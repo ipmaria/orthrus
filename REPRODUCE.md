@@ -19,6 +19,7 @@ directory adds what is missing, without modifying any upstream file.
 | Memory scaling (Figure 6) | ✗ | `src/eval/run_memory.py` |
 | Block-size ablation (Section 5) | ✗ | `src/eval/run_ablation.py` |
 | Objective ablation (Table 5) | ✗ | `--objective {kl,ce}` |
+| Accepted-length fine-tuning (stochastic decoding) | ✗ | `--objective accepted-length` |
 
 ---
 
@@ -266,7 +267,61 @@ being hard-label only. `fused_linear_forward_kl` therefore streams positions in 
 recomputes each chunk's logits in backward, making peak activation memory
 `O(chunk × vocab)` instead of `O(positions × vocab)`. Lower `--loss-chunk-size` if it OOMs.
 
-### 2.4 Table 5 (objective ablation)
+### 2.4 Stage 2: accepted-length fine-tuning
+
+Start from the **final CE/KL checkpoint**, not the init checkpoint, and use a new output
+directory. The trainer deliberately skips `copy_diff_from_ar` for this objective, so the
+trained diffusion twins are preserved; the AR backbone and LM head remain frozen.
+
+```bash
+torchrun --nproc_per_node=8 -m src.train.train_qwen3 \
+  --model-dir checkpoints/orthrus-qwen3-8b-kl/final \
+  --packed-cache-path data/processed/orthrus-packed-2048-asst \
+  --output-dir checkpoints/orthrus-qwen3-8b-kl-eal \
+  --objective accepted-length \
+  --seq-len 2048 --epochs 1 --lr 2e-5 \
+  --micro-batch-size 1 --grad-accum-steps 16 \
+  --fsdp2 --activation-checkpointing
+```
+
+For each block the loss uses the committed target text. With
+
+\[
+A_s = \min\left(1, \frac{Q_s(x_s)}{p_s(x_s)}\right), \qquad
+W_t = \prod_{s=1}^{t} A_s, \qquad
+J = \sum_{t=1}^{K-1} W_t, \qquad
+\mathcal{L} = -\frac{1}{M}\sum_{b=1}^{M}J_b,
+\]
+
+\(x_s\) is the committed dataset token at draft position \(s\); \(p_s(x_s)\) is its
+probability under the frozen AR teacher on the committed prefix; \(Q_s(x_s)\) is its
+probability under the parallel diffusion proposal; \(A_s\) is the stochastic acceptance
+probability; \(W_t\) is the probability that the first \(t\) draft tokens all survive;
+\(K\) is the configured block size; \(J\) is the target-path accepted-length estimate;
+\(b\) indexes valid blocks; \(M\) is the number of blocks with a nonempty supervised
+prefix; and \(\mathcal{L}\) is the scalar minimized by the optimizer. Indices \(s\) and
+\(t\) run over the \(K-1\) proposal positions actually consumed by `generate()`.
+
+The implementation installs the exact pathwise derivative, rather than treating the
+objective as arbitrarily weighted CE:
+
+\[
+\frac{\partial J}{\partial \log Q_s}
+= \mathbf{1}[Q_s < p_s]\sum_{t\geq s}W_t.
+\]
+
+Here \(\mathbf{1}[Q_s < p_s]\) is one only where the proposal probability is below the
+teacher probability and the acceptance cap is therefore active. The reverse cumulative
+sum gives the coefficient of position \(s\) in every later survival term. Both survival
+weights and this coefficient are stop-gradient; only \(\log Q_s\) carries the student
+gradient. A masked target truncates its block at the first missing position, and invalid
+blocks do not enter the mean. Logits are still projected and recomputed in whole-block
+chunks, so memory remains bounded by `--loss-chunk-size` up to that whole-block rounding.
+
+**Scope:** this is the estimator for stochastic token-level speculative verification.
+It is not an objective for the deterministic argmax-consensus path at `temperature=0`.
+
+### 2.5 Table 5 (objective ablation)
 
 Train twice, changing one flag, then evaluate both:
 
@@ -295,8 +350,10 @@ python -m pytest tests/test_dual_pass.py -q
 
 Covers block corruption (Eq. 5), absolute-position RoPE for packed blocks, the Eq. 6 mask
 rule, the K−1 supervision grid, teacher/student alignment, and the chunked KL against a
-naive full-vocabulary reference. Torch-only — no CUDA, FlexAttention or transformers
-needed, so it runs on a laptop.
+naive full-vocabulary reference. Accepted-length tests compare both value and gradient
+against direct dense autograd, check a finite difference, and verify mask truncation,
+block normalization, the acceptance cap, and empty-supervision behavior. Torch-only —
+no CUDA, FlexAttention or transformers needed, so they run on a laptop.
 
 ---
 

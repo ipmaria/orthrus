@@ -20,6 +20,8 @@ backbone with hard-label cross-entropy. Two differences, both deliberate:
     `chiennv/Orthrus-Qwen3-*` checkpoints actually run.
   * `--objective kl` (default) minimises the forward KL against the frozen AR head
     (Eq. 7). `--objective ce` reproduces the Table 5 ablation arm.
+    `--objective accepted-length` fine-tunes an already trained diffusion checkpoint
+    for target-path accepted length under stochastic speculative verification.
 
 Defaults follow Table 4 (256 anchors, K=32, 2 epochs, lr 2e-4, warmup 0.05, global batch
 128) with two deliberate departures for thinking-mode data: L=4096 instead of 2048, so a
@@ -58,7 +60,11 @@ from src.train.checkpoint import (
     save_final,
 )
 from src.train.dual_pass import dual_pass_forward
-from src.train.loss_kl import fused_linear_cross_entropy, fused_linear_forward_kl
+from src.train.loss_kl import (
+    fused_linear_accepted_length,
+    fused_linear_cross_entropy,
+    fused_linear_forward_kl,
+)
 from src.utils.data_utils import create_packed_dataloader
 
 try:
@@ -193,8 +199,17 @@ def train(args):
     model = OrthrusLM.from_pretrained(weights_dir, config=cfg, dtype=dtype)
 
     if resume_dir is None:
-        copy_diff_from_ar(model)
-        log_main(is_main, "Warm-started diffusion twins from frozen AR weights.")
+        if args.objective == "accepted-length":
+            # Stage two must continue from the stage-one diffusion weights. Recopying
+            # the AR projections here would silently erase the CE/KL warm start.
+            log_main(
+                is_main,
+                f"Fine-tuning existing diffusion twins from {weights_dir}; "
+                "AR-to-diffusion initialization skipped.",
+            )
+        else:
+            copy_diff_from_ar(model)
+            log_main(is_main, "Warm-started diffusion twins from frozen AR weights.")
     n_train, n_total = freeze_to_diffusion(model)
     if args.fp32_master and not args.fsdp2:
         # fp32 master weights for the trainable projections. Forward/backward still run in
@@ -242,9 +257,12 @@ def train(args):
     log_main(is_main, f"Orthrus-Qwen3 training | model_dir={args.model_dir} | "
                       f"world_size={world_size} | dtype={args.dtype} | "
                       f"attn={args.attn_implementation}")
-    log_main(is_main, f"Objective | {args.objective.upper()}" + (
-        "  (Eq. 7: forward KL vs the frozen AR teacher)" if args.objective == "kl"
-        else "  (Table 5 ablation arm: hard-label cross-entropy)"))
+    objective_description = {
+        "kl": "Eq. 7: forward KL vs the frozen AR teacher",
+        "ce": "Table 5 ablation arm: hard-label cross-entropy",
+        "accepted-length": "stage 2: negative target-path accepted length (stochastic decoding)",
+    }[args.objective]
+    log_main(is_main, f"Objective | {args.objective.upper()}  ({objective_description})")
     log_main(is_main, f"Config | seq_len={args.seq_len} | block_size={block_size} | "
                       f"micro_bsz={args.micro_batch_size} | grad_accum={args.grad_accum_steps} | "
                       f"anchors/seq={args.num_anchor_blocks} | lr={args.lr:.2e}")
@@ -344,6 +362,11 @@ def train(args):
                         head_weight, student, teacher, keep_mask,
                         chunk_size=args.loss_chunk_size,
                     )
+                elif args.objective == "accepted-length":
+                    loss = fused_linear_accepted_length(
+                        head_weight, student, teacher, labels,
+                        block_size=block_size, chunk_size=args.loss_chunk_size,
+                    )
                 else:
                     loss = fused_linear_cross_entropy(
                         head_weight, student, labels, chunk_size=args.loss_chunk_size,
@@ -381,17 +404,24 @@ def train(args):
                                  * world_size * args.log_every)
                 loss_value = loss.item() * args.grad_accum_steps
                 frac_valid = anchor_valid.float().mean().item()
+                accepted_length_log = (
+                    f" accepted_length={-loss_value:.4f}"
+                    if args.objective == "accepted-length" else ""
+                )
                 log_main(is_main, f"[train] epoch={epoch + 1}/{args.epochs} step={step} "
                                   f"{args.objective}_loss={loss_value:.4f} "
                                   f"lr={optimizer.param_groups[0]['lr']:.2e} "
                                   f"tok/s={tokens_logged / elapsed:,.0f} "
-                                  f"anchor_valid={frac_valid:.2f}")
+                                  f"anchor_valid={frac_valid:.2f}{accepted_length_log}")
                 if wandb_run is not None:
-                    wandb_run.log({f"train/{args.objective}_loss": loss_value,
-                                   "train/lr": optimizer.param_groups[0]["lr"],
-                                   "train/tokens_per_sec": tokens_logged / elapsed,
-                                   "train/anchor_valid": frac_valid,
-                                   "train/epoch": epoch + 1}, step=step)
+                    metrics = {f"train/{args.objective}_loss": loss_value,
+                               "train/lr": optimizer.param_groups[0]["lr"],
+                               "train/tokens_per_sec": tokens_logged / elapsed,
+                               "train/anchor_valid": frac_valid,
+                               "train/epoch": epoch + 1}
+                    if args.objective == "accepted-length":
+                        metrics["train/accepted_length"] = -loss_value
+                    wandb_run.log(metrics, step=step)
 
             if args.save_every > 0 and step % args.save_every == 0:
                 save_dir = os.path.join(args.output_dir, f"step-{step}")
@@ -429,7 +459,8 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=8)
     # Model / IO
     p.add_argument("--model-dir", type=str, required=True,
-                   help="Orthrus-Qwen3 init checkpoint (see src/utils/init_model_qwen3.py).")
+                   help="Orthrus-Qwen3 init checkpoint for CE/KL, or the completed "
+                        "CE/KL checkpoint for accepted-length fine-tuning.")
     p.add_argument("--output-dir", type=str, default="checkpoints/orthrus-qwen3-8b")
     p.add_argument("--resume-from", type=str, default=None)
     p.add_argument("--auto-resume", action="store_true",
@@ -442,9 +473,12 @@ def parse_args():
                         "Unlike the Qwen3.5 stack, sdpa/eager are correct here too -- "
                         "OrthrusModel.forward builds a real causal mask for them.")
     # Objective
-    p.add_argument("--objective", type=str, default="kl", choices=["kl", "ce"],
+    p.add_argument("--objective", type=str, default="kl",
+                   choices=["kl", "ce", "accepted-length"],
                    help="kl = paper Eq. 7 (forward KL vs the frozen AR head). "
-                        "ce = the hard-label arm ablated in Table 5.")
+                        "ce = the hard-label arm ablated in Table 5. "
+                        "accepted-length = stage-2 target-path fine-tuning from an "
+                        "existing CE/KL diffusion checkpoint (stochastic decoding).")
     p.add_argument("--loss-chunk-size", type=int, default=1024,
                    help="Positions per recomputed logit chunk. Peak activation memory is "
                         "~4 x chunk x vocab x 4B; lower it if the loss OOMs.")

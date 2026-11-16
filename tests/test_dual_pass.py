@@ -13,7 +13,11 @@ import torch.nn.functional as F
 
 from src.train.dual_pass import build_diffusion_blocks
 from src.train.loss import IGNORE_INDEX, block_local_labels
-from src.train.loss_kl import fused_linear_cross_entropy, fused_linear_forward_kl
+from src.train.loss_kl import (
+    fused_linear_accepted_length,
+    fused_linear_cross_entropy,
+    fused_linear_forward_kl,
+)
 
 MASK_ID = 999
 
@@ -220,3 +224,144 @@ def test_empty_supervision_keeps_the_graph_alive():
     loss.backward()
     assert loss.item() == 0.0
     assert student.grad is not None  # every rank still produces a gradient
+
+
+# Stage 2: target-path accepted length for stochastic speculative verification.
+
+def _naive_accepted_length(weight, student, teacher, labels, block_size):
+    """Dense autograd reference: differentiate J directly, with no surrogate."""
+    num_blocks = labels.shape[0] // block_size
+    hidden_size = student.shape[-1]
+    student = student.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    teacher = teacher.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    labels = labels.reshape(num_blocks, block_size)[:, :-1]
+
+    prefix = (labels != IGNORE_INDEX).cumprod(dim=-1).bool()
+    keep = prefix.any(dim=-1)
+    student, teacher, labels, prefix = (
+        student[keep], teacher[keep], labels[keep], prefix[keep]
+    )
+    labels = labels.masked_fill(~prefix, 0)
+
+    with torch.no_grad():
+        p = F.softmax(F.linear(teacher, weight).float(), dim=-1)
+        p = p.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    q = F.softmax(F.linear(student, weight).float(), dim=-1)
+    q = q.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+
+    accept = torch.where(prefix, (q / p).clamp_max(1.0), torch.ones_like(q))
+    survival = accept.cumprod(dim=-1) * prefix
+    return -survival.sum(dim=-1).mean()
+
+
+def _accepted_toy():
+    torch.manual_seed(7)
+    num_blocks, block_size, hidden_size, vocab = 4, 5, 6, 17
+    weight = torch.randn(vocab, hidden_size) * 0.4
+    student = torch.randn(num_blocks * block_size, hidden_size, requires_grad=True)
+    teacher = torch.randn(num_blocks * block_size, hidden_size) * 0.4
+    labels = torch.randint(0, vocab, (num_blocks, block_size))
+    labels[:, -1] = IGNORE_INDEX
+    labels[0, 2] = IGNORE_INDEX       # this block has a supervised prefix of length 2
+    labels[2, :] = IGNORE_INDEX       # invalid anchor: excluded from block normalization
+    labels[3, 1] = IGNORE_INDEX       # only the first target survives in this block
+    return weight, student, teacher, labels.reshape(-1), block_size
+
+
+def test_accepted_length_matches_dense_value_and_gradient():
+    weight, student, teacher, labels, block_size = _accepted_toy()
+    reference_student = student.detach().clone().requires_grad_(True)
+
+    # chunk_size < K-1 deliberately exercises whole-block chunking.
+    got = fused_linear_accepted_length(
+        weight, student, teacher, labels, block_size, chunk_size=3
+    )
+    expected = _naive_accepted_length(weight, reference_student, teacher, labels, block_size)
+    assert torch.allclose(got, expected, atol=1e-6), (got.item(), expected.item())
+
+    got.backward()
+    expected.backward()
+    assert torch.allclose(student.grad, reference_student.grad, atol=2e-6), (
+        (student.grad - reference_student.grad).abs().max().item()
+    )
+
+
+def test_accepted_length_gradient_matches_finite_difference():
+    torch.manual_seed(11)
+    num_blocks, block_size, hidden_size, vocab = 1, 4, 3, 9
+    weight = torch.randn(vocab, hidden_size) * 0.3
+    student = torch.randn(num_blocks * block_size, hidden_size, requires_grad=True)
+    teacher = torch.randn(num_blocks * block_size, hidden_size) * 0.3
+    labels = torch.tensor([2, 4, 1, IGNORE_INDEX])
+
+    loss = fused_linear_accepted_length(
+        weight, student, teacher, labels, block_size, chunk_size=2
+    )
+    loss.backward()
+    index = (1, 2)  # offset 1 is supervised; offset K-1 is not
+    analytic = student.grad[index].item()
+
+    epsilon = 1e-3
+    values = []
+    for sign in (-1.0, 1.0):
+        perturbed = student.detach().clone()
+        perturbed[index] += sign * epsilon
+        values.append(fused_linear_accepted_length(
+            weight, perturbed, teacher, labels, block_size, chunk_size=2
+        ).item())
+    numerical = (values[1] - values[0]) / (2.0 * epsilon)
+    assert abs(analytic - numerical) < 2e-3, (analytic, numerical)
+
+
+def test_accepted_length_masks_truncate_and_do_not_leak_gradients():
+    weight, student, teacher, labels, block_size = _accepted_toy()
+    baseline = fused_linear_accepted_length(
+        weight, student, teacher, labels, block_size, chunk_size=16
+    )
+
+    # Neither an ignored tail nor a wholly invalid block may affect the objective.
+    perturbed = student.detach().clone()
+    grid = perturbed.reshape(num_blocks := 4, block_size, -1)
+    grid[0, 2:] += 1000.0
+    grid[2, :] -= 1000.0
+    changed = fused_linear_accepted_length(
+        weight, perturbed, teacher, labels, block_size, chunk_size=16
+    )
+    assert torch.allclose(baseline, changed, atol=1e-6)
+
+    baseline.backward()
+    grad = student.grad.reshape(num_blocks, block_size, -1)
+    assert torch.count_nonzero(grad[0, 2:]) == 0
+    assert torch.count_nonzero(grad[2]) == 0
+    # The final offset is never a proposal consumed by generate().
+    assert torch.count_nonzero(grad[:, -1]) == 0
+
+
+def test_accepted_length_is_capped_and_has_zero_local_gradient_when_certain():
+    # p is uniform; Q puts essentially all mass on every committed target token.
+    weight = torch.eye(3)
+    teacher = torch.zeros(4, 3)
+    labels = torch.tensor([0, 1, 2, IGNORE_INDEX])
+    student = torch.zeros(4, 3, requires_grad=True)
+    with torch.no_grad():
+        student[0, 0] = student[1, 1] = student[2, 2] = 20.0
+
+    loss = fused_linear_accepted_length(
+        weight, student, teacher, labels, block_size=4, chunk_size=3
+    )
+    assert torch.allclose(loss, torch.tensor(-3.0), atol=1e-6)
+    loss.backward()
+    assert student.grad.abs().max().item() < 1e-6
+
+
+def test_accepted_length_empty_supervision_keeps_graph_alive():
+    weight = torch.randn(11, 4)
+    student = torch.randn(6, 4, requires_grad=True)
+    teacher = torch.randn(6, 4)
+    labels = torch.full((6,), IGNORE_INDEX)
+    loss = fused_linear_accepted_length(
+        weight, student, teacher, labels, block_size=3, chunk_size=2
+    )
+    loss.backward()
+    assert loss.item() == 0.0
+    assert student.grad is not None

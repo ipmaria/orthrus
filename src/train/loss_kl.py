@@ -1,4 +1,4 @@
-"""Forward-KL distillation objective (paper Eq. 7).
+"""Chunked KL, cross-entropy, and accepted-length training objectives.
 
 The released `src/train/loss.py` trains the diffusion view with cross-entropy against
 hard dataset tokens -- the variant the paper ablates in Table 5 (TPF 5.86). The method
@@ -127,3 +127,146 @@ def fused_linear_cross_entropy(
             use_reentrant=False,
         )
     return total / num_positions
+
+
+def _chunk_accepted_length(
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    prefix_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Negative target-path accepted length, summed over whole blocks.
+
+    All tensors are block-major: hidden states are [blocks, K-1, hidden], labels
+    and prefix_mask are [blocks, K-1]. The straight-through term below preserves
+    the scalar value -J while installing the exact pathwise derivative of J.
+    """
+    gather_index = labels.unsqueeze(-1)
+    with torch.no_grad():
+        teacher_logits = F.linear(teacher_hidden, lm_head_weight).float()
+        teacher_logprob = F.log_softmax(teacher_logits, dim=-1)
+        log_p = teacher_logprob.gather(-1, gather_index).squeeze(-1)
+
+    student_logits = F.linear(student_hidden, lm_head_weight).float()
+    student_logprob = F.log_softmax(student_logits, dim=-1)
+    log_q = student_logprob.gather(-1, gather_index).squeeze(-1)
+
+    # On the committed target path, token s survives stochastic speculative
+    # verification with probability min(1, Q_s(x_s) / p_s(x_s)). Compute that
+    # ratio in log space; neither the teacher nor the survival estimate carries
+    # autograd. The exact derivative is restored explicitly below.
+    log_ratio = log_q.detach() - log_p
+    accept_prob = torch.exp(log_ratio.clamp_max(0.0))
+    survival = torch.cumprod(accept_prob, dim=-1) * prefix_mask
+
+    # dJ / dlogQ_s = 1[Q_s < p_s] * sum_{t >= s} W_t. In particular, a
+    # position with Q_s >= p_s is already certainly accepted on this path and
+    # has zero local derivative through the capped acceptance probability.
+    suffix_survival = torch.cumsum(survival.flip(-1), dim=-1).flip(-1)
+    coefficient = (log_ratio < 0).to(survival.dtype) * suffix_survival
+    coefficient = coefficient * prefix_mask
+
+    accepted_length = survival.sum()
+    straight_through = (coefficient * (log_q - log_q.detach())).sum()
+    return -(accepted_length + straight_through)
+
+
+def fused_linear_accepted_length(
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    block_size: int,
+    chunk_size: int = 1024,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Mean negative accepted length over valid blocks (second-stage objective).
+
+    This is the target-path estimator for stochastic token-level speculative
+    decoding. For one block with committed target tokens x_1..x_T,
+
+        W_t = prod_{s <= t} min(1, Q_s(x_s) / p_s(x_s)),
+        J   = sum_{t <= T} W_t.
+
+    p_s comes from the frozen AR teacher on the committed prefix; Q_s comes
+    from the parallel diffusion proposal. The returned loss is -mean(J), with
+    the exact pathwise gradient
+
+        dJ / dlogQ_s = 1[Q_s < p_s] * sum_{t >= s} W_t.
+
+    Args:
+        lm_head_weight: frozen `lm_head.weight`, [vocab, hidden].
+        student_hidden: flattened diffusion hidden states, [B*K, hidden].
+        teacher_hidden: matching detached AR hidden states, [B*K, hidden].
+        labels: flattened block-local next-token labels, [B*K]. Offset K-1 is
+            ignored, as in generation. An ignored target truncates its block:
+            later positions cannot survive a missing earlier verification.
+        block_size: K, including the unsupervised final offset.
+        chunk_size: approximate supervised positions per recomputed chunk.
+            Chunks never split a block, so one chunk contains at least K-1
+            positions even if chunk_size is smaller.
+        ignore_index: label sentinel for padding / invalid supervision.
+
+    Returns:
+        Scalar -J averaged over blocks with at least one supervised position.
+
+    This estimator does not model greedy argmax consensus decoding.
+    """
+    if student_hidden.shape != teacher_hidden.shape:
+        raise ValueError(
+            f"student/teacher hidden mismatch: {tuple(student_hidden.shape)} vs "
+            f"{tuple(teacher_hidden.shape)}"
+        )
+    if student_hidden.ndim != 2 or labels.ndim != 1:
+        raise ValueError("student/teacher hidden must be [N, hidden], labels [N].")
+    if student_hidden.shape[0] != labels.shape[0]:
+        raise ValueError("hidden states and labels must contain the same positions.")
+    if teacher_hidden.requires_grad:
+        raise ValueError("teacher_hidden must be detached; the AR view is frozen.")
+    if block_size < 2:
+        raise ValueError("block_size must be at least 2.")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive.")
+    if labels.shape[0] % block_size != 0:
+        raise ValueError("the flattened supervision grid must contain whole blocks.")
+
+    num_blocks = labels.shape[0] // block_size
+    hidden_size = student_hidden.shape[-1]
+    student = student_hidden.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    teacher = teacher_hidden.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    block_labels = labels.reshape(num_blocks, block_size)[:, :-1]
+
+    # First-rejection semantics require a contiguous supervised target prefix.
+    # Do not skip a masked token and accidentally join two separate spans.
+    valid = block_labels != ignore_index
+    prefix_mask = valid.cumprod(dim=-1).bool()
+    block_keep = prefix_mask.any(dim=-1)
+    student = student[block_keep]
+    teacher = teacher[block_keep]
+    block_labels = block_labels[block_keep]
+    prefix_mask = prefix_mask[block_keep]
+
+    num_kept_blocks = student.shape[0]
+    if num_kept_blocks == 0:
+        # Keep the graph alive so DDP/FSDP still see a gradient for every rank.
+        return student_hidden.sum() * 0.0
+
+    # Ignored tail entries are never scored, but gather still needs a legal id.
+    block_labels = block_labels.masked_fill(~prefix_mask, 0)
+    positions_per_block = block_size - 1
+    blocks_per_chunk = max(1, chunk_size // positions_per_block)
+
+    total = student_hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, num_kept_blocks, blocks_per_chunk):
+        stop = min(start + blocks_per_chunk, num_kept_blocks)
+        total = total + checkpoint(
+            _chunk_accepted_length,
+            lm_head_weight,
+            student[start:stop],
+            teacher[start:stop],
+            block_labels[start:stop],
+            prefix_mask[start:stop],
+            use_reentrant=False,
+        )
+    return total / num_kept_blocks
