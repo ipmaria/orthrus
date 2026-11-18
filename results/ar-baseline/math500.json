@@ -1,0 +1,11 @@
+{
+  "task": "math500",
+  "model": "Qwen/Qwen3-0.6B",
+  "num_samples": 500,
+  "n_per_prompt": 4,
+  "max_new_tokens": 8192,
+  "temperature": 0.6,
+  "accuracy_autoregressive": 0.646,
+  "truncated_fraction": 0.2165,
+  "mean_generated_tokens": 4063.5
+}

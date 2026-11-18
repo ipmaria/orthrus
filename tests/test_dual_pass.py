@@ -11,8 +11,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from itertools import product
+from types import SimpleNamespace
 
-from src.train.dual_pass import build_diffusion_blocks
+from src.train.dual_pass import build_diffusion_blocks, dual_pass_forward
 from src.train.loss import IGNORE_INDEX, block_local_labels
 from src.train.loss_kl import (
     fused_linear_accepted_length,
@@ -439,3 +440,57 @@ def test_onpolicy_eal_matches_exact_enumeration_including_score_gradient():
     assert torch.allclose(estimator_logits.grad, exact_logits.grad, atol=3e-5), (
         estimator_logits.grad, exact_logits.grad
     )
+
+
+
+def test_onpolicy_dual_pass_preserves_batch_anchor_shape():
+    """Regression: sampled [B*A, K-1] tokens must be restored to [B, A, K-1]."""
+    torch.manual_seed(41)
+    batch, num_anchors, block_size = 2, 3, 4
+    seq_len, hidden_size, vocab = 32, 5, 11
+    input_ids = torch.randint(0, vocab, (batch, seq_len))
+    anchors = torch.tensor([[1, 8, 15], [2, 9, 16]])
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append((input_ids.clone(), kwargs))
+            hidden = torch.zeros(
+                *input_ids.shape, hidden_size,
+                requires_grad=kwargs.get("is_diffusion_pass", False),
+            )
+            cache = object() if kwargs.get("use_cache", False) else None
+            return SimpleNamespace(hidden_states=(hidden,), past_key_values=cache)
+
+    model = FakeModel()
+    weight = torch.randn(vocab, hidden_size)
+    student, teacher, keep, labels = dual_pass_forward(
+        model,
+        input_ids=input_ids,
+        anchors=anchors,
+        block_size=block_size,
+        mask_token_id=MASK_ID,
+        on_policy=True,
+        lm_head_weight=weight,
+        sampling_generator=torch.Generator().manual_seed(43),
+        sampling_chunk_size=2,
+    )
+
+    num_positions = batch * num_anchors * block_size
+    assert student.shape == (num_positions, hidden_size)
+    assert teacher.shape == (num_positions, hidden_size)
+    assert keep.shape == (num_positions,)
+    assert labels.shape == (num_positions,)
+    assert len(model.calls) == 3
+
+    verification_ids, verification_kwargs = model.calls[2]
+    assert verification_kwargs["is_verification_pass"]
+    verification_blocks = verification_ids.reshape(batch, num_anchors, block_size)
+    expected_anchors = torch.gather(input_ids, 1, anchors)
+    assert torch.equal(verification_blocks[:, :, 0], expected_anchors)
+
+    label_grid = labels.reshape(batch, num_anchors, block_size)
+    assert (label_grid[:, :, :-1] != IGNORE_INDEX).all()
+    assert (label_grid[:, :, -1] == IGNORE_INDEX).all()

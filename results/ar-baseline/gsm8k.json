@@ -1,0 +1,11 @@
+{
+  "task": "gsm8k",
+  "model": "Qwen/Qwen3-0.6B",
+  "num_samples": 1319,
+  "n_per_prompt": 4,
+  "max_new_tokens": 4096,
+  "temperature": 0.6,
+  "accuracy_autoregressive": 0.7699,
+  "truncated_fraction": 0.1133,
+  "mean_generated_tokens": 1743.5
+}

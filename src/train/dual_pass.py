@@ -196,7 +196,7 @@ def dual_pass_forward(
             chunk_size=sampling_chunk_size,
             temperature=sampling_temperature,
             generator=sampling_generator,
-        )
+        ).reshape(batch_size, num_anchors, block_size - 1)
         draft_blocks = block_ids.reshape(batch_size, num_anchors, block_size).clone()
         draft_blocks[:, :, 1:] = sampled_tokens
 

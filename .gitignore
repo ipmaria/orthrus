@@ -15,4 +15,4 @@ slurm-logs/
 =2.10.0
 src/model.py.before-a100
 training-code/
-results/
+
