@@ -21,7 +21,7 @@ backbone with hard-label cross-entropy. Two differences, both deliberate:
   * `--objective kl` (default) minimises the forward KL against the frozen AR head
     (Eq. 7). `--objective ce` reproduces the Table 5 ablation arm.
     `--objective accepted-length` fine-tunes an already trained diffusion checkpoint
-    for target-path accepted length under stochastic speculative verification.
+    with sampled-draft on-policy accepted length under stochastic verification.
 
 Defaults follow Table 4 (256 anchors, K=32, 2 epochs, lr 2e-4, warmup 0.05, global batch
 128) with two deliberate departures for thinking-mode data: L=4096 instead of 2048, so a
@@ -260,9 +260,12 @@ def train(args):
     objective_description = {
         "kl": "Eq. 7: forward KL vs the frozen AR teacher",
         "ce": "Table 5 ablation arm: hard-label cross-entropy",
-        "accepted-length": "stage 2: negative target-path accepted length (stochastic decoding)",
+        "accepted-length": "stage 2: negative accepted length (stochastic decoding)",
     }[args.objective]
     log_main(is_main, f"Objective | {args.objective.upper()}  ({objective_description})")
+    if args.objective == "accepted-length":
+        log_main(is_main, f"EAL | estimator={args.eal_estimator} | "
+                          f"temperature={args.eal_temperature}")
     log_main(is_main, f"Config | seq_len={args.seq_len} | block_size={block_size} | "
                       f"micro_bsz={args.micro_batch_size} | grad_accum={args.grad_accum_steps} | "
                       f"anchors/seq={args.num_anchor_blocks} | lr={args.lr:.2e}")
@@ -346,6 +349,11 @@ def train(args):
                     generator=anchor_gen, assistant_mask=assistant_mask,
                 )
 
+                head_weight = _lm_head_weight(base_model)
+                on_policy_eal = (
+                    args.objective == "accepted-length"
+                    and args.eal_estimator == "onpolicy"
+                )
                 student, teacher, keep_mask, labels = dual_pass_forward(
                     model,
                     input_ids=input_ids,
@@ -354,9 +362,13 @@ def train(args):
                     mask_token_id=cfg.mask_token_id,
                     anchor_valid=anchor_valid,
                     supervise_mask=assistant_mask,
+                    on_policy=on_policy_eal,
+                    lm_head_weight=head_weight,
+                    sampling_temperature=args.eal_temperature,
+                    sampling_generator=anchor_gen,
+                    sampling_chunk_size=args.loss_chunk_size,
                 )
 
-                head_weight = _lm_head_weight(base_model)
                 if args.objective == "kl":
                     loss = fused_linear_forward_kl(
                         head_weight, student, teacher, keep_mask,
@@ -366,6 +378,8 @@ def train(args):
                     loss = fused_linear_accepted_length(
                         head_weight, student, teacher, labels,
                         block_size=block_size, chunk_size=args.loss_chunk_size,
+                        temperature=args.eal_temperature,
+                        on_policy=on_policy_eal,
                     )
                 else:
                     loss = fused_linear_cross_entropy(
@@ -477,11 +491,19 @@ def parse_args():
                    choices=["kl", "ce", "accepted-length"],
                    help="kl = paper Eq. 7 (forward KL vs the frozen AR head). "
                         "ce = the hard-label arm ablated in Table 5. "
-                        "accepted-length = stage-2 target-path fine-tuning from an "
-                        "existing CE/KL diffusion checkpoint (stochastic decoding).")
+                        "accepted-length = stage-2 on-policy EAL from an existing "
+                        "CE/KL diffusion checkpoint (stochastic decoding).")
     p.add_argument("--loss-chunk-size", type=int, default=1024,
                    help="Positions per recomputed logit chunk. Peak activation memory is "
                         "~4 x chunk x vocab x 4B; lower it if the loss OOMs.")
+    p.add_argument("--eal-estimator", type=str, default="onpolicy",
+                   choices=["onpolicy", "target-path"],
+                   help="onpolicy = sampled drafts with p/Q survival and the full "
+                        "pathwise + score-function gradient; target-path = the previous "
+                        "committed-target Q/p pathwise estimator (ablation).")
+    p.add_argument("--eal-temperature", type=float, default=1.0,
+                   help="Positive temperature used both to sample drafts and to compute "
+                        "p/Q in EAL. Set it to the stochastic evaluation temperature.")
     # Training (defaults = paper Table 4)
     p.add_argument("--seq-len", type=int, default=4096,
                    help="Must match the packed cache. 4096 fits prompt + a thinking trace.")
@@ -489,7 +511,7 @@ def parse_args():
     p.add_argument("--grad-accum-steps", type=int, default=64,
                    help="global batch = micro_batch x grad_accum x world_size; the defaults "
                         "give the paper's 128 on a single GPU.")
-    p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--max-steps", type=int, default=0, help="0 = run full epochs")
     p.add_argument("--num-anchor-blocks", type=int, default=256)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -520,6 +542,8 @@ def parse_args():
         raise ValueError("--num-anchor-blocks must be > 0.")
     if args.micro_batch_size <= 0:
         raise ValueError("--micro-batch-size must be > 0.")
+    if not 0.0 < args.eal_temperature < float("inf"):
+        raise ValueError("--eal-temperature must be finite and positive.")
     return args
 
 

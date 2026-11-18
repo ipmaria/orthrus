@@ -69,6 +69,7 @@ def generate_dual_pass_mask(
     causal_limit: torch.Tensor,
     sparse_block_size: int = 128,
     compiled: bool = True,
+    causal_within_block: bool = False,
 ):
     # `H` is accepted for signature compatibility but deliberately ignored: the mask does
     # not depend on the head, so it is built once and broadcast (H=None). Building it per
@@ -85,6 +86,10 @@ def generate_dual_pass_mask(
         q_block_id = q_idx // block_size
         kv_block_id = draft_kv_idx // block_size
         valid_diffusion = (~is_kv_ar) & (q_block_id == kv_block_id)
+        if causal_within_block:
+            valid_diffusion = valid_diffusion & (
+                draft_kv_idx % block_size <= q_idx % block_size
+            )
         return valid_ar | valid_diffusion
 
     builder = _compiled_create_block_mask if compiled else create_block_mask
@@ -134,13 +139,14 @@ class OrthrusAttention(Qwen3Attention):
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         is_diffusion_pass: bool = False,
+        is_verification_pass: bool = False,
         causal_limit: torch.Tensor | None = None,
         ar_seq_len: int | None = None,
         flex_block_mask: BlockMask | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         
-        if not is_diffusion_pass:
+        if not (is_diffusion_pass or is_verification_pass):
             self.is_causal = True
             return super().forward(
                 hidden_states=hidden_states,
@@ -158,9 +164,16 @@ class OrthrusAttention(Qwen3Attention):
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings
         
-        query_states = self.q_norm_diff(self.q_proj_diff(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm_diff(self.k_proj_diff(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj_diff(hidden_states).view(hidden_shape).transpose(1, 2)
+        if is_diffusion_pass:
+            query_states = self.q_norm_diff(self.q_proj_diff(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm_diff(self.k_proj_diff(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj_diff(hidden_states).view(hidden_shape).transpose(1, 2)
+        else:
+            # Frozen AR verification of a sampled draft: same causal target law as
+            # generation, but packed blocks use a sparse block-causal mask.
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
@@ -199,7 +212,8 @@ class OrthrusAttention(Qwen3Attention):
             )
             
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj_diff(attn_output)
+        output_projection = self.o_proj_diff if is_diffusion_pass else self.o_proj
+        attn_output = output_projection(attn_output)
         
         return attn_output, None
     
@@ -277,6 +291,7 @@ class OrthrusModel(OrthrusPreTrainedModel):
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         is_diffusion_pass: bool = False,
+        is_verification_pass: bool = False,
         causal_limit: torch.Tensor | None = None,
         ar_seq_len: int | None = None,
         **kwargs,
@@ -305,8 +320,8 @@ class OrthrusModel(OrthrusPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         
         flex_block_mask = None
-        if self.training and is_diffusion_pass:
-            assert causal_limit is not None and ar_seq_len is not None, f"causal_limit={causal_limit} and ar_seq_len={ar_seq_len} are required for diffusion pass during training"
+        if self.training and (is_diffusion_pass or is_verification_pass):
+            assert causal_limit is not None and ar_seq_len is not None, f"causal_limit={causal_limit} and ar_seq_len={ar_seq_len} are required for diffusion/verification pass during training"
             batch_size, diffusion_length = inputs_embeds.shape[:2]
             flex_block_mask = generate_dual_pass_mask(
                 B=batch_size,
@@ -315,9 +330,10 @@ class OrthrusModel(OrthrusPreTrainedModel):
                 ar_len=ar_seq_len,
                 block_size=self.config.block_size,
                 causal_limit=causal_limit,
+                causal_within_block=is_verification_pass,
             )
         
-        if is_diffusion_pass or self.config._attn_implementation not in ["eager", "sdpa"]:
+        if is_diffusion_pass or is_verification_pass or self.config._attn_implementation not in ["eager", "sdpa"]:
             causal_mask = attention_mask
         else:
             causal_mask = create_causal_mask(
@@ -338,6 +354,7 @@ class OrthrusModel(OrthrusPreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 is_diffusion_pass=is_diffusion_pass,
+                is_verification_pass=is_verification_pass,
                 causal_limit=causal_limit,
                 ar_seq_len=ar_seq_len,
                 flex_block_mask=flex_block_mask,
@@ -375,6 +392,7 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         is_diffusion_pass: bool = False,
+        is_verification_pass: bool = False,
         causal_limit: torch.Tensor | None = None,
         ar_seq_len: int | None = None,
         **kwargs,
@@ -388,6 +406,7 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             cache_position=cache_position,
             is_diffusion_pass=is_diffusion_pass,
+            is_verification_pass=is_verification_pass,
             causal_limit=causal_limit,
             ar_seq_len=ar_seq_len,
             **kwargs,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from itertools import product
 
 from src.train.dual_pass import build_diffusion_blocks
 from src.train.loss import IGNORE_INDEX, block_local_labels
@@ -365,3 +366,76 @@ def test_accepted_length_empty_supervision_keeps_graph_alive():
     loss.backward()
     assert loss.item() == 0.0
     assert student.grad is not None
+
+
+def test_onpolicy_eal_matches_exact_enumeration_including_score_gradient():
+    """Enumerate every draft path: a fixed-path derivative would fail this test."""
+    torch.manual_seed(29)
+    length, vocab = 3, 2
+    block_size = length + 1
+    base_logits = torch.randn(length, vocab) * 0.7
+    exact_logits = base_logits.clone().requires_grad_(True)
+    estimator_logits = base_logits.clone().requires_grad_(True)
+    weight = torch.eye(vocab)
+
+    # A separate AR conditional for every sampled prefix, stored as logits.
+    teacher_logits = {}
+    for path in product(range(vocab), repeat=length):
+        for s in range(length):
+            key = (s, path[:s])
+            if key not in teacher_logits:
+                teacher_logits[key] = torch.randn(vocab) * 0.7
+
+    def path_probabilities(logits, path):
+        q_values = []
+        p_values = []
+        for s, token in enumerate(path):
+            q_values.append(F.softmax(logits[s] / 1.0, dim=-1)[token])
+            p_values.append(F.softmax(
+                teacher_logits[(s, path[:s])] / 1.0, dim=-1
+            )[token])
+        return q_values, p_values
+
+    # Exact deployed expectation: sum_y Q(y) J(y), differentiated directly.
+    exact_expected_j = exact_logits.new_zeros(())
+    for path in product(range(vocab), repeat=length):
+        q_values, p_values = path_probabilities(exact_logits, path)
+        acceptance = [torch.minimum(
+            torch.ones_like(p_values[s]), p_values[s] / q_values[s]
+        ) for s in range(length)]
+        survival = torch.cumprod(torch.stack(acceptance), dim=0)
+        draft_probability = torch.stack(q_values).prod()
+        exact_expected_j = exact_expected_j + draft_probability * survival.sum()
+    (-exact_expected_j).backward()
+
+    # The implementation is evaluated on every sampled path, weighted by the
+    # fixed sampling law. Its surrogate must reproduce the FULL expectation
+    # gradient, not merely the derivative through p/Q along one fixed path.
+    estimated_loss = estimator_logits.new_zeros(())
+    for path in product(range(vocab), repeat=length):
+        q_detached = F.softmax(base_logits, dim=-1)
+        draft_probability = torch.stack([
+            q_detached[s, token] for s, token in enumerate(path)
+        ]).prod().detach()
+        student = torch.cat([
+            estimator_logits,
+            estimator_logits.new_zeros(1, vocab),
+        ], dim=0)
+        teacher = torch.cat([
+            torch.stack([
+                teacher_logits[(s, path[:s])] for s in range(length)
+            ]),
+            torch.zeros(1, vocab),
+        ], dim=0)
+        labels = torch.tensor([*path, IGNORE_INDEX])
+        path_loss = fused_linear_accepted_length(
+            weight, student, teacher, labels, block_size,
+            chunk_size=2, temperature=1.0, on_policy=True,
+        )
+        estimated_loss = estimated_loss + draft_probability * path_loss
+
+    assert torch.allclose(estimated_loss, -exact_expected_j, atol=2e-6)
+    estimated_loss.backward()
+    assert torch.allclose(estimator_logits.grad, exact_logits.grad, atol=3e-5), (
+        estimator_logits.grad, exact_logits.grad
+    )

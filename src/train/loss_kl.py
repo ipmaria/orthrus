@@ -135,36 +135,47 @@ def _chunk_accepted_length(
     teacher_hidden: torch.Tensor,
     labels: torch.Tensor,
     prefix_mask: torch.Tensor,
+    temperature: float,
+    on_policy: bool,
 ) -> torch.Tensor:
-    """Negative target-path accepted length, summed over whole blocks.
+    """Negative accepted length, summed over whole blocks.
 
     All tensors are block-major: hidden states are [blocks, K-1, hidden], labels
-    and prefix_mask are [blocks, K-1]. The straight-through term below preserves
-    the scalar value -J while installing the exact pathwise derivative of J.
+    and prefix_mask are [blocks, K-1]. The straight-through term preserves -J
+    while installing the requested target-path or full on-policy derivative.
     """
     gather_index = labels.unsqueeze(-1)
     with torch.no_grad():
-        teacher_logits = F.linear(teacher_hidden, lm_head_weight).float()
+        teacher_logits = F.linear(teacher_hidden, lm_head_weight).float() / temperature
         teacher_logprob = F.log_softmax(teacher_logits, dim=-1)
         log_p = teacher_logprob.gather(-1, gather_index).squeeze(-1)
 
-    student_logits = F.linear(student_hidden, lm_head_weight).float()
+    student_logits = F.linear(student_hidden, lm_head_weight).float() / temperature
     student_logprob = F.log_softmax(student_logits, dim=-1)
     log_q = student_logprob.gather(-1, gather_index).squeeze(-1)
 
-    # On the committed target path, token s survives stochastic speculative
-    # verification with probability min(1, Q_s(x_s) / p_s(x_s)). Compute that
-    # ratio in log space; neither the teacher nor the survival estimate carries
-    # autograd. The exact derivative is restored explicitly below.
-    log_ratio = log_q.detach() - log_p
+    # Compute the deployed acceptance ratio in log space. Neither the teacher
+    # nor the survival estimate carries autograd; the exact derivative is
+    # restored explicitly below.
+    detached_log_q = log_q.detach()
+    if on_policy:
+        # y_s ~ Q_s: acceptance is min(1, p_s(y_s) / Q_s(y_s)). The
+        # coefficient below is the combined pathwise + score-function gradient.
+        log_ratio = log_p - detached_log_q
+        active = detached_log_q <= log_p
+    else:
+        # x_s ~ p_s: target-path acceptance estimate is min(1, Q_s/p_s),
+        # and only the pathwise derivative is needed because p is fixed.
+        log_ratio = detached_log_q - log_p
+        active = detached_log_q < log_p
     accept_prob = torch.exp(log_ratio.clamp_max(0.0))
     survival = torch.cumprod(accept_prob, dim=-1) * prefix_mask
 
-    # dJ / dlogQ_s = 1[Q_s < p_s] * sum_{t >= s} W_t. In particular, a
-    # position with Q_s >= p_s is already certainly accepted on this path and
-    # has zero local derivative through the capped acceptance probability.
+    # Target path: dJ/dlogQ_s = 1[Q_s < p_s] sum_{t >= s} W_t.
+    # On policy: the same-looking coefficient with p/Q survival and Q_s <= p_s
+    # includes both dJ and J*dlogQ(path); the score-function term is not omitted.
     suffix_survival = torch.cumsum(survival.flip(-1), dim=-1).flip(-1)
-    coefficient = (log_ratio < 0).to(survival.dtype) * suffix_survival
+    coefficient = active.to(survival.dtype) * suffix_survival
     coefficient = coefficient * prefix_mask
 
     accepted_length = survival.sum()
@@ -180,20 +191,29 @@ def fused_linear_accepted_length(
     block_size: int,
     chunk_size: int = 1024,
     ignore_index: int = -100,
+    temperature: float = 1.0,
+    on_policy: bool = False,
 ) -> torch.Tensor:
     """Mean negative accepted length over valid blocks (second-stage objective).
 
-    This is the target-path estimator for stochastic token-level speculative
-    decoding. For one block with committed target tokens x_1..x_T,
+    With on_policy=True, labels are sampled draft tokens y_s ~ Q_s and teacher
+    hidden states follow the sampled draft prefix. The estimator is
+
+        f_t = prod_{s <= t} min(1, p_s(y_s) / Q_s(y_s)),
+        J   = sum_{t <= T} f_t.
+
+    Its coefficient 1[Q_s <= p_s] * sum_{t >= s} f_t includes BOTH the pathwise
+    derivative and J times the draft path's score-function derivative.
+
+    With on_policy=False, labels are committed target tokens x_s ~ p_s and the
+    original target-path estimator is used:
 
         W_t = prod_{s <= t} min(1, Q_s(x_s) / p_s(x_s)),
         J   = sum_{t <= T} W_t.
 
-    p_s comes from the frozen AR teacher on the committed prefix; Q_s comes
-    from the parallel diffusion proposal. The returned loss is -mean(J), with
-    the exact pathwise gradient
-
-        dJ / dlogQ_s = 1[Q_s < p_s] * sum_{t >= s} W_t.
+    In both cases the returned scalar is -mean(J); only the exact gradient
+    differs. p_s comes from the frozen AR teacher and Q_s from the parallel
+    diffusion proposal.
 
     Args:
         lm_head_weight: frozen `lm_head.weight`, [vocab, hidden].
@@ -207,6 +227,9 @@ def fused_linear_accepted_length(
             Chunks never split a block, so one chunk contains at least K-1
             positions even if chunk_size is smaller.
         ignore_index: label sentinel for padding / invalid supervision.
+        temperature: positive sampling temperature applied to both distributions.
+        on_policy: use sampled-draft p/Q survival and the combined gradient;
+            False keeps the committed-target Q/p pathwise estimator.
 
     Returns:
         Scalar -J averaged over blocks with at least one supervised position.
@@ -228,6 +251,8 @@ def fused_linear_accepted_length(
         raise ValueError("block_size must be at least 2.")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
+    if not 0.0 < temperature < float("inf"):
+        raise ValueError("temperature must be finite and positive.")
     if labels.shape[0] % block_size != 0:
         raise ValueError("the flattened supervision grid must contain whole blocks.")
 
@@ -267,6 +292,8 @@ def fused_linear_accepted_length(
             teacher[start:stop],
             block_labels[start:stop],
             prefix_mask[start:stop],
+            temperature,
+            on_policy,
             use_reentrant=False,
         )
     return total / num_kept_blocks

@@ -267,59 +267,86 @@ being hard-label only. `fused_linear_forward_kl` therefore streams positions in 
 recomputes each chunk's logits in backward, making peak activation memory
 `O(chunk × vocab)` instead of `O(positions × vocab)`. Lower `--loss-chunk-size` if it OOMs.
 
-### 2.4 Stage 2: accepted-length fine-tuning
+### 2.4 Stage 2: on-policy accepted-length fine-tuning
 
 Start from the **final CE/KL checkpoint**, not the init checkpoint, and use a new output
 directory. The trainer deliberately skips `copy_diff_from_ar` for this objective, so the
-trained diffusion twins are preserved; the AR backbone and LM head remain frozen.
+trained diffusion twins are preserved; the AR backbone and LM head remain frozen. The
+default estimator is sampled-draft/on-policy EAL for stochastic verification:
 
 ```bash
 torchrun --nproc_per_node=8 -m src.train.train_qwen3 \
   --model-dir checkpoints/orthrus-qwen3-8b-kl/final \
   --packed-cache-path data/processed/orthrus-packed-2048-asst \
-  --output-dir checkpoints/orthrus-qwen3-8b-kl-eal \
+  --output-dir checkpoints/orthrus-qwen3-8b-kl-onpolicy-eal-t1 \
   --objective accepted-length \
+  --eal-estimator onpolicy --eal-temperature 1.0 \
   --seq-len 2048 --epochs 1 --lr 2e-5 \
   --micro-batch-size 1 --grad-accum-steps 16 \
   --fsdp2 --activation-checkpointing
 ```
 
-For each block the loss uses the committed target text. With
+On a single GPU, invoke the same module directly with `python` (or use
+`torchrun --nproc_per_node=1`) and omit `--fsdp2`; the extra flags are not a requirement
+for EAL. There is **no KL anchor or KL weight** in this stage.
+
+For every block, the current diffusion proposal first samples an actual draft
+\(y_1,\ldots,y_D\), where \(D=K-1\) and \(K\) is the configured block size. A second
+frozen AR pass evaluates the teacher causally along that sampled prefix. Define
 
 \[
-A_s = \min\left(1, \frac{Q_s(x_s)}{p_s(x_s)}\right), \qquad
-W_t = \prod_{s=1}^{t} A_s, \qquad
-J = \sum_{t=1}^{K-1} W_t, \qquad
-\mathcal{L} = -\frac{1}{M}\sum_{b=1}^{M}J_b,
+r_s=\min\left(1,\frac{p_s(y_s)}{Q_s(y_s)}\right),\qquad
+f_t=\prod_{s=1}^{t}r_s,\qquad
+J(y)=\sum_{t=1}^{D}f_t,\qquad
+\mathcal{L}=-\frac{1}{M}\sum_{b=1}^{M}J(y^{(b)}).
 \]
 
-\(x_s\) is the committed dataset token at draft position \(s\); \(p_s(x_s)\) is its
-probability under the frozen AR teacher on the committed prefix; \(Q_s(x_s)\) is its
-probability under the parallel diffusion proposal; \(A_s\) is the stochastic acceptance
-probability; \(W_t\) is the probability that the first \(t\) draft tokens all survive;
-\(K\) is the configured block size; \(J\) is the target-path accepted-length estimate;
-\(b\) indexes valid blocks; \(M\) is the number of blocks with a nonempty supervised
-prefix; and \(\mathcal{L}\) is the scalar minimized by the optimizer. Indices \(s\) and
-\(t\) run over the \(K-1\) proposal positions actually consumed by `generate()`.
+Here \(y_s\sim Q_s\) is the token actually sampled by the diffusion proposal at draft
+position \(s\); \(Q_s(y_s)\) is its proposal probability; \(p_s(y_s)\) is its probability
+under the frozen AR teacher **after the sampled prefix \(y_{<s}\)**, not after the committed
+dataset tokens; \(r_s\) is exactly the stochastic speculative-decoding acceptance ratio;
+\(f_t\) is survival through the first \(t\) draft tokens; and \(J\) is the number of accepted
+draft tokens on that path. \(b\) indexes valid blocks, \(M\) is the number of blocks with a
+nonempty supervised prefix, and \(\mathcal{L}\) is minimized. Both distributions use the same
+positive `--eal-temperature`.
 
-The implementation installs the exact pathwise derivative, rather than treating the
-objective as arbitrarily weighted CE:
+Because the sampling distribution itself depends on the trainable parameters \(\theta\),
+the objective is an expectation and its full derivative is
 
 \[
-\frac{\partial J}{\partial \log Q_s}
-= \mathbf{1}[Q_s < p_s]\sum_{t\geq s}W_t.
+\nabla_\theta\mathbb{E}_{y\sim Q_\theta}[J_\theta(y)]
+=\mathbb{E}_{y\sim Q_\theta}\left[
+\nabla_\theta J_\theta(y)
++J_\theta(y)\nabla_\theta\log Q_\theta(y)
+\right].
 \]
 
-Here \(\mathbf{1}[Q_s < p_s]\) is one only where the proposal probability is below the
-teacher probability and the acceptance cap is therefore active. The reverse cumulative
-sum gives the coefficient of position \(s\) in every later survival term. Both survival
-weights and this coefficient are stop-gradient; only \(\log Q_s\) carries the student
-gradient. A masked target truncates its block at the first missing position, and invalid
-blocks do not enter the mean. Logits are still projected and recomputed in whole-block
-chunks, so memory remains bounded by `--loss-chunk-size` up to that whole-block rounding.
+The first term differentiates survival on a fixed path; the second is the score-function
+term caused by changing the probability of sampling that path. The implementation uses an
+expectation-equivalent per-path coefficient
 
-**Scope:** this is the estimator for stochastic token-level speculative verification.
-It is not an objective for the deterministic argmax-consensus path at `temperature=0`.
+\[
+c_s=\mathbf{1}[Q_s(y_s)\leq p_s(y_s)]\sum_{t\geq s}f_t,
+\]
+
+multiplying \(\nabla_\theta\log Q_s(y_s)\). The omitted prefix terms have zero conditional
+expectation; they are not silently dropped from the expectation gradient. Survival weights
+and \(c_s\) are stop-gradient. A straight-through surrogate leaves the scalar value equal to
+\(-J\) while installing this derivative. A masked target truncates its block at the first
+missing position, invalid blocks do not enter the mean, and whole-block chunking keeps
+full-vocabulary activation memory bounded by `--loss-chunk-size` up to block rounding.
+
+The additional frozen AR verification pass is training-only and does not change inference.
+It adds training time and activations, but no trainable parameters or KL regularizer.
+
+**Ablation:** `--eal-estimator target-path` preserves the earlier committed-target estimator
+with \(W_t=\prod_{s\leq t}\min(1,Q_s(x_s)/p_s(x_s))\). It is useful for comparison, but it
+estimates survival on dataset tokens rather than on drafts drawn from the current proposal,
+so it is not the default for temperature-1 on-policy training.
+
+**Scope:** on-policy EAL matches stochastic token-level speculative verification. It is not
+an objective for deterministic argmax-consensus decoding at `temperature=0`; that path uses
+same-position argmax agreement instead of \(p/Q\) acceptance.
 
 ### 2.5 Table 5 (objective ablation)
 
@@ -350,9 +377,11 @@ python -m pytest tests/test_dual_pass.py -q
 
 Covers block corruption (Eq. 5), absolute-position RoPE for packed blocks, the Eq. 6 mask
 rule, the K−1 supervision grid, teacher/student alignment, and the chunked KL against a
-naive full-vocabulary reference. Accepted-length tests compare both value and gradient
-against direct dense autograd, check a finite difference, and verify mask truncation,
-block normalization, the acceptance cap, and empty-supervision behavior. Torch-only —
+naive full-vocabulary reference. Target-path accepted-length tests compare value and
+pathwise gradient against direct dense autograd and a finite difference. The on-policy
+test enumerates every draft path and differentiates the exact expectation directly,
+checking the combined pathwise and score-function gradient; mask truncation, block
+normalization, the acceptance cap, and empty supervision are also covered. Torch-only —
 no CUDA, FlexAttention or transformers needed, so they run on a laptop.
 
 ---

@@ -22,6 +22,7 @@ chunked, on just the supervised positions.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from src.train.loss import IGNORE_INDEX, block_local_labels
 
@@ -65,6 +66,46 @@ def build_diffusion_blocks(
     )
 
 
+@torch.no_grad()
+def sample_draft_tokens(
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    block_size: int,
+    chunk_size: int = 1024,
+    temperature: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample y_s ~ Q_s independently at the K-1 deployed proposal offsets.
+
+    Returns [num_blocks, K-1]. The full vocabulary is streamed in chunks and no
+    sampling graph is retained; differentiable log Q_s is recomputed in the loss.
+    """
+    if block_size < 2 or chunk_size <= 0:
+        raise ValueError("block_size must be >= 2 and chunk_size must be positive.")
+    if not 0.0 < temperature < float("inf"):
+        raise ValueError("temperature must be finite and positive.")
+    if student_hidden.shape[0] % block_size != 0:
+        raise ValueError("student_hidden must contain whole blocks.")
+
+    num_blocks = student_hidden.shape[0] // block_size
+    proposal_hidden = student_hidden.reshape(
+        num_blocks, block_size, student_hidden.shape[-1]
+    )[:, :-1].reshape(-1, student_hidden.shape[-1])
+    sampled = torch.empty(
+        proposal_hidden.shape[0], dtype=torch.long, device=proposal_hidden.device
+    )
+    for start in range(0, proposal_hidden.shape[0], chunk_size):
+        stop = min(start + chunk_size, proposal_hidden.shape[0])
+        logits = F.linear(
+            proposal_hidden[start:stop], lm_head_weight
+        ).float() / temperature
+        probabilities = F.softmax(logits, dim=-1)
+        sampled[start:stop] = torch.multinomial(
+            probabilities, 1, generator=generator
+        ).squeeze(-1)
+    return sampled.reshape(num_blocks, block_size - 1)
+
+
 def dual_pass_forward(
     model,
     input_ids: torch.Tensor,
@@ -73,6 +114,11 @@ def dual_pass_forward(
     mask_token_id: int,
     anchor_valid: torch.Tensor | None = None,
     supervise_mask: torch.Tensor | None = None,
+    on_policy: bool = False,
+    lm_head_weight: torch.Tensor | None = None,
+    sampling_temperature: float = 1.0,
+    sampling_generator: torch.Generator | None = None,
+    sampling_chunk_size: int = 1024,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the frozen AR pass and the trainable diffusion pass over one micro-batch.
 
@@ -84,6 +130,11 @@ def dual_pass_forward(
     supervised -- its target lies outside the block, and `generate()` discards that
     row too (`src/model.py:477`, `logits[:, :-1]`). That is the `block_size - 1`
     supervised positions the official trainer already logs.
+
+    With on_policy=True, proposal tokens are first sampled from the current
+    diffusion view. A second frozen AR verification pass follows each sampled
+    block causally, and the returned labels/teacher rows describe that draft path
+    rather than the committed target path.
     """
     batch_size, seq_len = input_ids.shape
     num_anchors = anchors.shape[1]
@@ -134,6 +185,47 @@ def dual_pass_forward(
         supervise_mask=supervise_mask, anchor_valid=anchor_valid,
     )
     keep_mask = labels != IGNORE_INDEX
+
+    if on_policy:
+        if lm_head_weight is None:
+            raise ValueError("lm_head_weight is required for on-policy EAL.")
+        sampled_tokens = sample_draft_tokens(
+            lm_head_weight,
+            student.reshape(-1, hidden_size),
+            block_size,
+            chunk_size=sampling_chunk_size,
+            temperature=sampling_temperature,
+            generator=sampling_generator,
+        )
+        draft_blocks = block_ids.reshape(batch_size, num_anchors, block_size).clone()
+        draft_blocks[:, :, 1:] = sampled_tokens
+
+        # The target p_s must follow y_<s, not the committed dataset tokens.
+        # This pass uses AR projections and a causal within-block mask; gradients
+        # remain stopped and use_cache=False keeps the shared clean cache intact.
+        with torch.no_grad():
+            verification_outputs = model(
+                input_ids=draft_blocks.reshape(batch_size, num_anchors * block_size),
+                position_ids=block_positions,
+                past_key_values=shared_cache,
+                use_cache=False,
+                is_verification_pass=True,
+                causal_limit=causal_limit,
+                ar_seq_len=seq_len,
+                logits_to_keep=1,
+            )
+        teacher = verification_outputs.hidden_states[0].detach().reshape(
+            batch_size, num_anchors, block_size, hidden_size
+        )
+
+        sampled_labels = torch.full_like(labels, IGNORE_INDEX)
+        sampled_labels[:, :, :-1] = draft_blocks[:, :, 1:]
+        target_prefix = (labels[:, :, :-1] != IGNORE_INDEX).cumprod(dim=-1).bool()
+        sampled_labels[:, :, :-1] = sampled_labels[:, :, :-1].masked_fill(
+            ~target_prefix, IGNORE_INDEX
+        )
+        labels = sampled_labels
+        keep_mask = labels != IGNORE_INDEX
 
     return (
         student.reshape(-1, hidden_size),
