@@ -885,3 +885,72 @@ def test_onpolicy_dual_pass_multiple_drafts_shapes():
     )
     loss.backward()
     assert torch.isfinite(loss)
+
+
+# Published stage-2 baselines (LK, LK-hybrid, WTV, streak) against dense references.
+
+def _naive_baseline(kind, weight, student, teacher, labels, block_size, eta=3.0, gamma=0.8):
+    num_blocks = labels.shape[0] // block_size
+    hidden_size = student.shape[-1]
+    student = student.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    teacher = teacher.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    labels = labels.reshape(num_blocks, block_size)[:, :-1]
+    valid = labels != IGNORE_INDEX
+    with torch.no_grad():
+        p = F.softmax(F.linear(teacher, weight), dim=-1)
+    log_q = F.log_softmax(F.linear(student, weight), dim=-1)
+    q = log_q.exp()
+    alpha = torch.minimum(p, q).sum(dim=-1)
+    if kind in ("lk", "lk-hybrid"):
+        mask = valid.float()
+        count = mask.sum(dim=0)
+        weights = gamma ** torch.arange(labels.shape[1], dtype=torch.float32)
+        weights = weights * (count > 0).float()
+        if kind == "lk":
+            per_offset = (-alpha.log() * mask).sum(dim=0) / count.clamp_min(1.0)
+        else:
+            kl = (p * (p.log() - log_q)).sum(dim=-1)
+            lam = torch.exp(-eta * ((alpha * mask).sum(0) / count.clamp_min(1.0)).detach())
+            per_offset = ((lam * kl + (1 - lam) * (1 - alpha)) * mask).sum(0) \
+                / count.clamp_min(1.0)
+        return (weights * per_offset).sum()
+    prefix = valid.cumprod(dim=-1).bool()
+    keep = prefix.any(dim=-1)
+    if kind == "wtv":
+        per_position = alpha
+    else:
+        per_position = q.gather(-1, labels.masked_fill(~prefix, 0).unsqueeze(-1)).squeeze(-1)
+    survival = torch.where(prefix, per_position, torch.ones_like(per_position)).cumprod(-1)
+    return -(survival * prefix).sum(dim=-1)[keep].mean()
+
+
+def test_baseline_losses_match_dense_reference_value_and_gradient():
+    from src.train.loss_kl import fused_linear_baseline_loss
+
+    for kind in ("lk", "lk-hybrid", "wtv", "streak"):
+        weight, student, teacher, labels, block_size = _accepted_toy()
+        reference_student = student.detach().clone().requires_grad_(True)
+        got = fused_linear_baseline_loss(
+            kind, weight, student, teacher, labels, block_size, chunk_size=3
+        )
+        expected = _naive_baseline(kind, weight, reference_student, teacher, labels,
+                                   block_size)
+        assert torch.allclose(got, expected, atol=1e-5), (kind, got.item(), expected.item())
+        got.backward()
+        expected.backward()
+        assert torch.allclose(student.grad, reference_student.grad, atol=1e-5), kind
+
+
+def test_lk_is_zero_and_wtv_is_minus_depth_when_views_agree():
+    from src.train.loss_kl import fused_linear_baseline_loss
+
+    torch.manual_seed(67)
+    weight = torch.randn(13, 6)
+    hidden = torch.randn(3 * 5, 6)
+    labels = torch.randint(0, 13, (3, 5))
+    labels[:, -1] = IGNORE_INDEX
+    labels = labels.reshape(-1)
+    lk = fused_linear_baseline_loss("lk", weight, hidden.clone(), hidden, labels, 5)
+    wtv = fused_linear_baseline_loss("wtv", weight, hidden.clone(), hidden, labels, 5)
+    assert abs(lk.item()) < 1e-5
+    assert abs(wtv.item() + 4.0) < 1e-5

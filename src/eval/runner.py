@@ -49,8 +49,13 @@ def build_input_ids(tokenizer, prompt: str, enable_thinking: bool = True,
 
 @torch.inference_mode()
 def generate_orthrus(model, input_ids: torch.Tensor, max_new_tokens: int,
-                     temperature: float = 0.0, top_k: int = 20, top_p: float = 0.8):
-    """Dual-view decoding: 1 prefill + 2 passes per consensus cycle."""
+                     temperature: float = 0.0, top_k: int = 20, top_p: float = 0.8,
+                     num_drafts: int = 1):
+    """Dual-view decoding: 1 prefill + 2 passes per consensus cycle.
+
+    num_drafts > 1 (stochastic decoding only) verifies that many i.i.d. drafts as a tree
+    in the same single verification pass, so the pass count per cycle is unchanged.
+    """
     device = input_ids.device
     with ForwardPassCounter(model) as counter, BenchmarkTimer(device) as timer:
         output_ids = model.generate(
@@ -60,6 +65,7 @@ def generate_orthrus(model, input_ids: torch.Tensor, max_new_tokens: int,
             top_k=top_k,
             top_p=top_p,
             use_diffusion_mode=True,
+            num_drafts=num_drafts,
         )
     return output_ids, counter.count, timer.elapsed
 

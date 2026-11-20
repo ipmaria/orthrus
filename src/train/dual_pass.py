@@ -120,6 +120,7 @@ def dual_pass_forward(
     sampling_generator: torch.Generator | None = None,
     sampling_chunk_size: int = 1024,
     num_drafts: int = 1,
+    causal_drafting: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the frozen AR pass and the trainable diffusion pass over one micro-batch.
 
@@ -175,6 +176,8 @@ def dual_pass_forward(
         causal_limit=causal_limit,
         ar_seq_len=seq_len,
         logits_to_keep=1,
+        # Control arm for noise conditioning: same causal in-block mask, no noise.
+        causal_within_block=causal_drafting,
     )
     diff_hidden = diff_outputs.hidden_states[0]  # [batch, B * K, hidden]
 
@@ -253,3 +256,107 @@ def dual_pass_forward(
         keep_mask.reshape(-1),
         labels.reshape(-1),
     )
+
+
+def noise_conditioned_dual_pass(
+    model,
+    input_ids: torch.Tensor,
+    anchors: torch.Tensor,
+    block_size: int,
+    mask_token_id: int,
+    lm_head_weight: torch.Tensor,
+    embed_weight: torch.Tensor,
+    top_m: int,
+    anchor_valid: torch.Tensor | None = None,
+    supervise_mask: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    generator: torch.Generator | None = None,
+    chunk_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual pass for noise-conditioned drafting (src/noise_coupling.py).
+
+    1. Frozen AR pass (shared cache + teacher rows), as in `dual_pass_forward`.
+    2. Noise-free diffusion pass under no_grad: its top-`top_m` tokens per position are
+       the reveal support S, exactly as `generate()` chooses it.
+    3. For every supervised position, G_S is drawn from the posterior given the committed
+       token x (prior noise where unsupervised). On teacher rollouts this is the joint law
+       of real decoding (coupling), so no drafts need to be sampled.
+    4. Trainable diffusion pass with the revealed-noise features, CAUSAL within the
+       block (a draft position may only see noise of positions <= its own).
+
+    Returns `(student_hidden [N, H], log_target [N], keep_mask [N], labels [N])`, where
+    log_target = log p(x | G_S), the law the verifier will check x against.
+    """
+    if top_m < 1:
+        raise ValueError("top_m must be >= 1.")
+    batch_size, seq_len = input_ids.shape
+    num_anchors = anchors.shape[1]
+    block_ids, block_positions, causal_limit = build_diffusion_blocks(
+        input_ids, anchors, block_size, mask_token_id
+    )
+    with torch.no_grad():
+        ar_outputs = model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
+        ar_hidden = ar_outputs.hidden_states[0].detach()
+        shared_cache = ar_outputs.past_key_values
+        diff_kwargs = dict(
+            input_ids=block_ids, position_ids=block_positions,
+            past_key_values=shared_cache, use_cache=False, is_diffusion_pass=True,
+            causal_limit=causal_limit, ar_seq_len=seq_len, logits_to_keep=1,
+        )
+        proposal_hidden = model(**diff_kwargs).hidden_states[0].detach()
+
+    hidden_size = ar_hidden.shape[-1]
+    offsets = torch.arange(block_size, device=input_ids.device)
+    positions = anchors.unsqueeze(-1) + offsets.reshape(1, 1, -1)
+    gather_index = positions.reshape(batch_size, -1, 1).expand(-1, -1, hidden_size)
+    teacher = torch.gather(ar_hidden, 1, gather_index).reshape(-1, hidden_size)
+    proposal = proposal_hidden.reshape(-1, hidden_size)
+    labels = block_local_labels(
+        input_ids, anchors, block_size,
+        supervise_mask=supervise_mask, anchor_valid=anchor_valid,
+    ).reshape(-1)
+    valid = labels != IGNORE_INDEX
+    safe_labels = labels.clamp_min(0)
+
+    from src.noise_coupling import (
+        noise_features, posterior_gumbel_on_support, revealed_log_law_at, sample_gumbel,
+    )
+
+    num_positions = labels.shape[0]
+    log_target = torch.zeros(num_positions, dtype=torch.float32, device=input_ids.device)
+    features = torch.zeros(num_positions, 2 * hidden_size, dtype=embed_weight.dtype,
+                           device=input_ids.device)
+    with torch.no_grad():
+        for start in range(0, num_positions, chunk_size):
+            stop = min(start + chunk_size, num_positions)
+            support = (F.linear(proposal[start:stop], lm_head_weight).float()
+                       / temperature).topk(top_m, dim=-1).indices
+            teacher_logprob = F.log_softmax(
+                F.linear(teacher[start:stop], lm_head_weight).float() / temperature, dim=-1
+            )
+            log_p_support = teacher_logprob.gather(-1, support)
+            label = safe_labels[start:stop]
+            log_p_label = teacher_logprob.gather(-1, label.unsqueeze(-1)).squeeze(-1)
+            in_support = support == label.unsqueeze(-1)
+            chunk_valid = valid[start:stop]
+            posterior = posterior_gumbel_on_support(log_p_support, in_support, generator)
+            prior = sample_gumbel(support.shape, generator=generator, device=support.device)
+            gumbel = torch.where(chunk_valid.unsqueeze(-1), posterior, prior)
+            log_target[start:stop] = torch.where(
+                chunk_valid,
+                revealed_log_law_at(log_p_support, gumbel, log_p_label, in_support),
+                torch.zeros_like(log_p_label),
+            )
+            features[start:stop] = noise_features(embed_weight, support, gumbel).to(
+                features.dtype)
+
+    # The last block offset predicts nothing at inference: reveal nothing there.
+    features = features.reshape(batch_size, num_anchors, block_size, -1)
+    features[:, :, -1] = 0
+    # Causal within the block: position i may only see the noise of positions <= i
+    # (non-causal reveal breaks losslessness; see src/noise_coupling.py).
+    student = model(
+        **diff_kwargs, causal_within_block=True,
+        noise_features=features.reshape(batch_size, num_anchors * block_size, -1),
+    ).hidden_states[0].reshape(-1, hidden_size)
+    return student, log_target, valid, labels

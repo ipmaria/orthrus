@@ -660,3 +660,346 @@ def fused_linear_expected_rounds(
     survival = torch.cat(pieces, dim=0).reshape(num_windows, window_len, depth)
     rounds = expected_rounds_from_survival(survival)
     return (rounds / window_len).mean()
+
+
+# ---------------------------------------------------------------------------------
+# Published baselines on the committed (target) path, for the stage-2 comparison
+# ---------------------------------------------------------------------------------
+#
+#   lk          LK^alpha (Samarin et al., 2026): -log alpha_j, alpha_j = sum_v min(p, Q)
+#               = 1 - TV, per supervised position.
+#   lk-hybrid   LK^lambda: lambda_j KL(p||Q) + (1 - lambda_j) TV(p, Q),
+#               lambda_j = exp(-eta * sg[mean alpha at offset j]) (per draft position,
+#               averaged over the batch's blocks), eta = 3 by default.
+#               Both LK variants weight offset j (0-based) by gamma^j, gamma = 0.8 -- the
+#               paper's per-head weight, with block offsets playing the role of heads.
+#   wtv         Window TV (Xia et al., 2026): -sum_k prod_{j<=k} (1 - TV_j) over the
+#               block, on the committed prefix.
+#   streak      SpecDiff-2 streak-distillation (Sandler et al., 2025):
+#               -sum_m prod_{j<=m} Q_j(x_j), x = verifier samples (use teacher rollouts).
+#
+# All use the frozen AR teacher at the committed prefix and the same temperature.
+
+BASELINE_OBJECTIVES = ("lk", "lk-hybrid", "wtv", "streak")
+
+
+def _chunk_lk_statistics(
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    valid_mask: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Per-offset sums over blocks: [4, D] = (KL, TV, -log alpha, count)."""
+    with torch.no_grad():
+        teacher_logits = F.linear(teacher_hidden, lm_head_weight).float() / temperature
+        teacher_logprob = F.log_softmax(teacher_logits, dim=-1)
+        teacher_prob = teacher_logprob.exp()
+    student_logits = F.linear(student_hidden, lm_head_weight).float() / temperature
+    student_logprob = F.log_softmax(student_logits, dim=-1)
+    student_prob = student_logprob.exp()
+
+    mask = valid_mask.to(torch.float32)
+    kl = (teacher_prob * (teacher_logprob - student_logprob)).sum(dim=-1)
+    alpha = torch.minimum(teacher_prob, student_prob).sum(dim=-1)
+    tv = 1.0 - alpha
+    neg_log_alpha = -alpha.clamp_min(1e-12).log()
+    return torch.stack([
+        (kl * mask).sum(dim=0),
+        (tv * mask).sum(dim=0),
+        (neg_log_alpha * mask).sum(dim=0),
+        mask.sum(dim=0),
+    ])
+
+
+def _chunk_window_product(
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    prefix_mask: torch.Tensor,
+    temperature: float,
+    kind: str,
+) -> torch.Tensor:
+    """-sum_k prod_{j<=k} a_j summed over blocks; a = 1 - TV (wtv) or Q(x) (streak)."""
+    student_logits = F.linear(student_hidden, lm_head_weight).float() / temperature
+    student_logprob = F.log_softmax(student_logits, dim=-1)
+    if kind == "wtv":
+        with torch.no_grad():
+            teacher_prob = F.softmax(
+                F.linear(teacher_hidden, lm_head_weight).float() / temperature, dim=-1
+            )
+        per_position = torch.minimum(teacher_prob, student_logprob.exp()).sum(dim=-1)
+    else:
+        per_position = student_logprob.gather(-1, labels.unsqueeze(-1)).squeeze(-1).exp()
+    survival = torch.cumprod(per_position, dim=-1) * prefix_mask.to(per_position.dtype)
+    return -survival.sum()
+
+
+def fused_linear_baseline_loss(
+    kind: str,
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    block_size: int,
+    chunk_size: int = 1024,
+    ignore_index: int = -100,
+    temperature: float = 1.0,
+    lk_eta: float = 3.0,
+    lk_gamma: float = 0.8,
+) -> torch.Tensor:
+    """One of BASELINE_OBJECTIVES on the target-path inputs (as for target-path EAL).
+
+    lk / lk-hybrid: sum_j gamma^j * mean over blocks with a supervised offset j.
+    wtv / streak: mean over blocks with a non-empty supervised prefix of -sum_k prod a.
+    """
+    if kind not in BASELINE_OBJECTIVES:
+        raise ValueError(f"unknown baseline objective {kind!r}.")
+    if student_hidden.shape != teacher_hidden.shape:
+        raise ValueError(
+            f"student/teacher hidden mismatch: {tuple(student_hidden.shape)} vs "
+            f"{tuple(teacher_hidden.shape)}"
+        )
+    if student_hidden.ndim != 2 or labels.ndim != 1 or labels.shape[0] != student_hidden.shape[0]:
+        raise ValueError("hidden states must be [N, hidden] and labels [N].")
+    if teacher_hidden.requires_grad:
+        raise ValueError("teacher_hidden must be detached; the AR view is frozen.")
+    if block_size < 2 or chunk_size <= 0 or labels.shape[0] % block_size != 0:
+        raise ValueError("need block_size >= 2, chunk_size > 0 and whole blocks.")
+    if not 0.0 < temperature < float("inf") or lk_eta <= 0.0 or lk_gamma <= 0.0:
+        raise ValueError("temperature, lk_eta and lk_gamma must be positive.")
+
+    num_blocks = labels.shape[0] // block_size
+    depth = block_size - 1
+    hidden_size = student_hidden.shape[-1]
+    student = student_hidden.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    teacher = teacher_hidden.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    block_labels = labels.reshape(num_blocks, block_size)[:, :-1]
+    valid = block_labels != ignore_index
+    blocks_per_chunk = max(1, chunk_size // depth)
+
+    if kind in ("lk", "lk-hybrid"):
+        keep = valid.any(dim=-1)
+        student, teacher, valid = student[keep], teacher[keep], valid[keep]
+        if student.shape[0] == 0:
+            return student_hidden.sum() * 0.0
+        stats = student_hidden.new_zeros((4, depth), dtype=torch.float32)
+        for start in range(0, student.shape[0], blocks_per_chunk):
+            stop = min(start + blocks_per_chunk, student.shape[0])
+            stats = stats + checkpoint(
+                _chunk_lk_statistics, lm_head_weight, student[start:stop],
+                teacher[start:stop], valid[start:stop], temperature,
+                use_reentrant=False,
+            )
+        kl_sum, tv_sum, nla_sum, count = stats
+        present = count > 0
+        count = count.clamp_min(1.0)
+        weights = lk_gamma ** torch.arange(depth, device=stats.device, dtype=stats.dtype)
+        weights = weights * present.to(stats.dtype)
+        if kind == "lk":
+            per_offset = nla_sum / count
+        else:
+            mean_alpha = (1.0 - tv_sum / count).detach()
+            lam = torch.exp(-lk_eta * mean_alpha)
+            per_offset = (lam * kl_sum + (1.0 - lam) * tv_sum) / count
+        return (weights * per_offset).sum()
+
+    prefix_mask = valid.to(torch.int64).cumprod(dim=-1).bool()
+    keep = prefix_mask.any(dim=-1)
+    student, teacher = student[keep], teacher[keep]
+    prefix_mask = prefix_mask[keep]
+    block_labels = block_labels[keep].masked_fill(~prefix_mask, 0)
+    if student.shape[0] == 0:
+        return student_hidden.sum() * 0.0
+    total = student_hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, student.shape[0], blocks_per_chunk):
+        stop = min(start + blocks_per_chunk, student.shape[0])
+        total = total + checkpoint(
+            _chunk_window_product, lm_head_weight, student[start:stop],
+            teacher[start:stop], block_labels[start:stop], prefix_mask[start:stop],
+            temperature, kind, use_reentrant=False,
+        )
+    return total / student.shape[0]
+
+
+# ---------------------------------------------------------------------------------
+# Noise-conditioned drafting: target-path EAL against the revealed law p(x | G_S)
+# ---------------------------------------------------------------------------------
+
+
+def _chunk_conditioned_survival(
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    log_target: torch.Tensor,
+    labels: torch.Tensor,
+    prefix_mask: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    student_logits = F.linear(student_hidden, lm_head_weight).float() / temperature
+    log_q = F.log_softmax(student_logits, dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    accept = torch.exp((log_q - log_target).clamp_max(0.0))
+    survival = torch.cumprod(accept, dim=-1) * prefix_mask.to(accept.dtype)
+    return -survival.sum()
+
+
+def fused_linear_conditioned_target_path(
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    log_target: torch.Tensor,
+    labels: torch.Tensor,
+    block_size: int,
+    chunk_size: int = 1024,
+    ignore_index: int = -100,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """-mean_blocks sum_t prod_{s<=t} min(1, Q_s(x_s) / target_s(x_s)).
+
+    Target-path EAL with a per-position target given as log-probability of the committed
+    token: log p(x | G_S) from `noise_conditioned_dual_pass`. On teacher rollouts with
+    posterior noise this is unbiased for the accepted length of noise-conditioned
+    decoding (coupling), with an exact pathwise gradient and no draft sampling.
+    """
+    if student_hidden.ndim != 2 or labels.ndim != 1 or log_target.shape != labels.shape:
+        raise ValueError("student_hidden must be [N, H]; labels and log_target [N].")
+    if student_hidden.shape[0] != labels.shape[0] or labels.shape[0] % block_size:
+        raise ValueError("positions must align and form whole blocks.")
+    if log_target.requires_grad:
+        raise ValueError("log_target must be detached.")
+    if block_size < 2 or chunk_size <= 0 or not 0.0 < temperature < float("inf"):
+        raise ValueError("need block_size >= 2, chunk_size > 0, positive temperature.")
+    num_blocks = labels.shape[0] // block_size
+    depth = block_size - 1
+    student = student_hidden.reshape(num_blocks, block_size, -1)[:, :-1]
+    target = log_target.reshape(num_blocks, block_size)[:, :-1].float()
+    block_labels = labels.reshape(num_blocks, block_size)[:, :-1]
+    prefix_mask = (block_labels != ignore_index).to(torch.int64).cumprod(dim=-1).bool()
+    keep = prefix_mask.any(dim=-1)
+    if not keep.any():
+        return student_hidden.sum() * 0.0
+    student, target, prefix_mask = student[keep], target[keep], prefix_mask[keep]
+    block_labels = block_labels[keep].masked_fill(~prefix_mask, 0)
+    target = target.masked_fill(~prefix_mask, 0.0)
+    blocks_per_chunk = max(1, chunk_size // depth)
+    total = student_hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, student.shape[0], blocks_per_chunk):
+        stop = min(start + blocks_per_chunk, student.shape[0])
+        total = total + checkpoint(
+            _chunk_conditioned_survival, lm_head_weight, student[start:stop],
+            target[start:stop], block_labels[start:stop], prefix_mask[start:stop],
+            temperature, use_reentrant=False,
+        )
+    return total / student.shape[0]
+
+
+# ---------------------------------------------------------------------------------
+# DBLAST (re-implementation, see src/dblast.py)
+# ---------------------------------------------------------------------------------
+
+DBLAST_OBJECTIVES = ("al", "nll")
+
+
+def _chunk_dblast(
+    lm_head_weight, expander_weight, expander_bias, prior_weight, prior_bias,
+    block_hidden, log_p, labels, prefix_mask, num_categories, kind, tau, temperature,
+):
+    from src.dblast import al_objective_terms, branch_hidden, category_log_prior
+
+    branches = branch_hidden(block_hidden, expander_weight, expander_bias, num_categories)
+    logits = F.linear(branches, lm_head_weight).float() / temperature        # [b, D, K, V]
+    log_q_branch = F.log_softmax(logits, dim=-1).gather(
+        -1, labels[:, :, None, None].expand(-1, -1, num_categories, 1)
+    ).squeeze(-1)                                                           # [b, D, K]
+    log_prior = category_log_prior(block_hidden[:, 0], prior_weight, prior_bias,
+                                   num_categories)
+    objective, log_q_prefix, _, _ = al_objective_terms(
+        log_q_branch, log_prior, log_p, prefix_mask, tau
+    )
+    if kind == "al":
+        return -objective.sum()
+    last = prefix_mask.to(torch.int64).sum(1) - 1                           # dependent NLL
+    return -log_q_prefix.gather(1, last.unsqueeze(1)).sum()
+
+
+def fused_linear_dblast(
+    kind: str,
+    lm_head_weight: torch.Tensor,
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    block_size: int,
+    num_categories: int,
+    expander_weight: torch.Tensor | None = None,
+    expander_bias: torch.Tensor | None = None,
+    prior_weight: torch.Tensor | None = None,
+    prior_bias: torch.Tensor | None = None,
+    tau: float = 0.1,
+    temperature: float = 1.0,
+    target_top_k: int = 0,
+    target_top_p: float = 1.0,
+    chunk_size: int = 1024,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """DBLAST losses on target-path inputs, mean over blocks.
+
+    kind="al": -J_AL (paper Eq. 16); kind="nll": dependent NLL (paper Eq. 8; with K=1
+    the independent NLL of plain DFlash training). The target is filtered with the same
+    temperature / top-k / top-p as the trajectories; a committed token outside that
+    filter (p = 0, impossible on matching rollouts) truncates its block.
+    """
+    if kind not in DBLAST_OBJECTIVES:
+        raise ValueError(f"unknown DBLAST objective {kind!r}.")
+    if num_categories < 1:
+        raise ValueError("num_categories must be >= 1.")
+    if num_categories > 1 and any(t is None for t in (expander_weight, expander_bias,
+                                                      prior_weight, prior_bias)):
+        raise ValueError("K > 1 needs the expander and prior heads.")
+    if student_hidden.shape != teacher_hidden.shape or labels.ndim != 1 \
+            or labels.shape[0] != student_hidden.shape[0] or labels.shape[0] % block_size:
+        raise ValueError("student/teacher [N, H] and labels [N] over whole blocks.")
+    if teacher_hidden.requires_grad:
+        raise ValueError("teacher_hidden must be detached; the AR view is frozen.")
+    if block_size < 2 or chunk_size <= 0 or not 0.0 < tau < 1.0 \
+            or not 0.0 < temperature < float("inf"):
+        raise ValueError("invalid block_size / chunk_size / tau / temperature.")
+
+    from src.dblast import filtered_log_probs
+
+    num_blocks = labels.shape[0] // block_size
+    depth = block_size - 1
+    hidden_size = student_hidden.shape[-1]
+    student = student_hidden.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    teacher = teacher_hidden.reshape(num_blocks, block_size, hidden_size)[:, :-1]
+    block_labels = labels.reshape(num_blocks, block_size)[:, :-1]
+    valid = block_labels != ignore_index
+    safe_labels = block_labels.masked_fill(~valid, 0)
+
+    log_p = torch.empty(num_blocks, depth, dtype=torch.float32, device=labels.device)
+    rows = max(1, chunk_size // depth)
+    with torch.no_grad():
+        for start in range(0, num_blocks, rows):
+            stop = min(start + rows, num_blocks)
+            log_p[start:stop] = filtered_log_probs(
+                F.linear(teacher[start:stop], lm_head_weight), temperature,
+                target_top_k, target_top_p,
+            ).gather(-1, safe_labels[start:stop].unsqueeze(-1)).squeeze(-1)
+    valid = valid & torch.isfinite(log_p)
+    prefix_mask = valid.to(torch.int64).cumprod(dim=-1).bool()
+    keep = prefix_mask.any(dim=-1)
+    if not keep.any():
+        return student_hidden.sum() * 0.0
+    student, log_p = student[keep], log_p[keep]
+    prefix_mask, safe_labels = prefix_mask[keep], safe_labels[keep]
+    log_p = log_p.masked_fill(~prefix_mask, 0.0)
+
+    blocks_per_chunk = max(1, chunk_size // (depth * num_categories))
+    total = student_hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, student.shape[0], blocks_per_chunk):
+        stop = min(start + blocks_per_chunk, student.shape[0])
+        total = total + checkpoint(
+            _chunk_dblast, lm_head_weight, expander_weight, expander_bias, prior_weight,
+            prior_bias, student[start:stop], log_p[start:stop], safe_labels[start:stop],
+            prefix_mask[start:stop], num_categories, kind, tau, temperature,
+            use_reentrant=False,
+        )
+    return total / student.shape[0]

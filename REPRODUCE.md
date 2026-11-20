@@ -423,6 +423,24 @@ generate the corpus with `scripts/generate_onpolicy.py --temperature T --top-p 1
 sampled, so there is no verification pass and no score-function variance. On dataset text
 it inherits target-path's bias. The log reports `tokens_per_round ≈ 1/loss`.
 
+#### Published baselines (`--objective lk | lk-hybrid | wtv | streak`)
+
+Same target-path inputs (committed tokens, AR teacher at the committed prefix), same
+temperature, same stage-2 recipe; see `loss_kl.py` for the exact forms. `--lk-eta` (3)
+and `--lk-gamma` (0.8) follow the LK paper, with block offsets in the role of its draft
+heads. Run `streak` on teacher rollouts (corpus B below): SpecDiff-2 defines it on
+verifier samples.
+
+#### Tree decoding at inference (`run_benchmark --num-drafts N`)
+
+`generate(num_drafts=N)` (temperature > 0 only) samples N drafts from the one diffusion
+pass, verifies all of them in ONE packed AR verification pass with a tree mask, walks the
+tree with recursive rejection (`src/tree_verify.py`, lossless), and copies the accepted
+chain's K/V from that same pass into the cache. Passes per cycle stay 2, so TPF and the
+`accept` column remain comparable. Needs `--attn-implementation sdpa` (or eager).
+`scripts/check_tree_decoding.py` checks the K/V commit against a plain AR forward, the
+output distribution against AR sampling, and tokens/s for several N.
+
 **Scope:** on-policy EAL matches stochastic token-level speculative verification. It is not
 an objective for deterministic argmax-consensus decoding at `temperature=0`; that path uses
 same-position argmax agreement instead of \(p/Q\) acceptance.
@@ -445,6 +463,140 @@ The paper predicts **identical accuracy** (86.2% either way — the consensus me
 guarantees it) and a TPF gap (6.35 for KL against 5.86 for CE). That accuracy is invariant
 while TPF is not is the sharpest single test of the whole architecture: consensus makes
 the objective irrelevant to *what* is produced and relevant only to *how fast*.
+
+### 2.6 Stage-2 experiments
+
+**Match training and evaluation.** `generate()` applies top-k/top-p to both p and Q,
+while every stage-2 loss uses the full softmax. Evaluate stage-2 runs with
+`--temperature T --top-k 0 --top-p 1.0` and train them with `--eal-temperature T`.
+
+```bash
+# corpora on the same prompts: A = dataset responses, B = teacher rollouts at T=1
+python scripts/build_orthrus_corpus.py --keep-responses --per-domain 50000 --balance --out data/A.jsonl
+python scripts/build_packed_cache.py --dataset-path data/A.jsonl --out data/A-packed --model-dir $INIT --seq-len 2048
+python scripts/build_orthrus_corpus.py --per-domain 50000 --balance --out data/prompts.jsonl
+python scripts/generate_onpolicy.py --in data/prompts.jsonl --out data/B.jsonl \
+  --model Qwen/Qwen3-1.7B --temperature 1.0 --top-p 1.0 --top-k -1   # vLLM: -1 or 0 disables
+python scripts/build_packed_cache_ids.py --dataset-path data/B.jsonl --out data/B-packed --model-dir $INIT --seq-len 2048
+
+train() { torchrun --nproc_per_node=8 -m src.train.train_qwen3 --model-dir $S1 \
+  --seq-len 2048 --epochs 1 --max-steps 2000 --lr 2e-5 --eal-temperature 1.0 \
+  --micro-batch-size 1 --grad-accum-steps 16 --fsdp2 --activation-checkpointing "$@"; }
+evalm() { python -m src.eval.run_benchmark --model-dir ck/$1/final --tasks gsm8k math500 \
+  --temperature 1.0 --top-k 0 --top-p 1.0 --output-dir results/$1${2:+-n$2} ${2:+--num-drafts $2}; }
+
+# E1  target-path on dataset text vs teacher rollouts (coupling) vs rb on dataset text
+train --objective accepted-length --eal-estimator target-path --packed-cache-path data/A-packed --output-dir ck/tp-A
+train --objective accepted-length --eal-estimator target-path --packed-cache-path data/B-packed --output-dir ck/tp-B
+train --objective accepted-length --eal-estimator rb          --packed-cache-path data/A-packed --output-dir ck/rb-A
+# E2  onpolicy vs rb (+ drafts/LOO); gradient noise on a fixed batch, single GPU
+train --objective accepted-length --eal-estimator onpolicy --packed-cache-path data/A-packed --output-dir ck/op-A
+train --objective accepted-length --eal-estimator rb --eal-num-drafts 4 --packed-cache-path data/A-packed --output-dir ck/rb4-A
+for e in onpolicy rb; do python scripts/grad_variance.py --model-dir $S1 --packed-cache-path data/A-packed \
+  --seq-len 2048 --micro-batch-size 1 --objective accepted-length --eal-estimator $e \
+  --repeats 16 --num-batches 4 --vary sampling --param-filter 'layers\.(0|13|27)\.' --out results/gv-$e.json; done
+# (--vary all compares sampled estimators with target-path on data/B-packed on equal footing)
+# E3  published baselines, same budget
+for o in lk lk-hybrid wtv; do train --objective $o --packed-cache-path data/A-packed --output-dir ck/$o-A; done
+train --objective streak --packed-cache-path data/B-packed --output-dir ck/streak-B
+# E4  one draft vs tree decoding, and training for the tree
+train --objective accepted-length --eal-estimator multidraft --eal-num-drafts 4 --packed-cache-path data/A-packed --output-dir ck/md4-A
+for r in tp-A tp-B rb-A op-A rb4-A lk-A lk-hybrid-A wtv-A streak-B md4-A; do evalm $r; done
+for r in rb-A md4-A; do for n in 2 4; do evalm $r $n; done; done
+python scripts/check_tree_decoding.py --model-dir ck/md4-A/final --num-drafts 1 2 4
+```
+
+Report acceptance length / TPF with confidence intervals over examples (evaluation at
+T=1 is stochastic and `run_benchmark` has no seed flag: repeat runs), tokens/s for E4,
+and for E2 the `snr` / `relative_noise` from `grad_variance.py` next to the learning
+curves per wall-clock hour (rb with 4 drafts costs 4 verification passes per step).
+
+---
+
+### 2.7 Noise-conditioned drafting (`--objective noise-eal`)
+
+**Idea.** A one-step parallel drafter proposes a product of marginals, so under ordinary
+stochastic verification it hits a factorization ceiling: E[accepted] < D whenever the
+target's block law is not a product. The target samples by Gumbel-max,
+\(x_t=\arg\max_v \log p_t(v)+G_{tv}\); with the noise fixed its continuation is a
+deterministic function of context and noise, which a factorized predictor can match.
+So the verifier's noise is shared with the drafter **as an input**.
+
+**Partial reveal (lossless).** The drafter sees \(G\) only on a support \(S_t\) (top-m of
+its own noise-free proposal, chosen before the noise). Given \(G_S\) the target law is closed form,
+\(p(\cdot\mid G_S)=w\,\delta_{v^*}+(1-w)\,p|_{S^c}/p(S^c)\), \(w=\exp(-p(S^c)e^{-s^*})\), and it
+averages back to \(p\). Ordinary speculative sampling against \(p(\cdot\mid G_S)\) is therefore
+lossless. m=0 is plain SD; m=V is exact-match decoding.
+
+**Causality (required).** Draft position i may only see the noise of positions ≤ i.
+Otherwise reaching position j leaks information about \(G_j\) and the output is no longer
+\(\sim p\) (Monte Carlo of a full round: TV 0.034 non-causal vs 0.011 causal, MC noise
+≈0.017). The noise-conditioned diffusion pass therefore uses a causal in-block mask.
+
+**Training for free.** On teacher rollouts (corpus B, §2.6), \(G_S\) is drawn from the
+posterior given the committed token (truncated Gumbel), which reproduces the prior joint
+law of decoding. Target-path EAL against \(p(x\mid G_S)\) is then unbiased and score-free
+(coupling); no drafts are sampled. Per step: frozen AR pass, noise-free diffusion pass
+(support), trainable causal diffusion pass with the noise features.
+
+**Inference.** At T > 0 a cycle is noise-free diffusion pass → support → Gumbel noise
+on the support → noise-conditioned causal diffusion pass → AR verification against the
+revealed laws: 3 passes per cycle (`run_benchmark` accounts for it). T = 0 is unchanged.
+Needs `--attn-implementation sdpa` (or eager). The projection `noise_proj_diff` is
+zero-initialised, so the run starts exactly at the noise-free checkpoint.
+
+```bash
+train --objective noise-eal --noise-reveal-top-m 32 --packed-cache-path data/B-packed \
+      --output-dir ck/noise-B
+python scripts/check_noise_decoding.py --model-dir ck/noise-B/final        # lossless + accept
+evalm noise-B                                     # vs tp-B / rb-A from §2.6, same T=1 eval
+```
+
+Evidence so far is toy-scale only (`scripts/toy_noise_reveal.py`, D=4, V=4 Markov
+targets): the best factorized drafter reaches 2.9 / 3.3 of 4 under plain SD. With full
+reveal an exact drafter reaches 4.0. With logit error σ=0.3 it gains +21% / +24%; at
+σ=1.0 full reveal can lose up to 5% while partial reveal does not. A quantile
+(sorted-CDF) encoding of the noise fails: token order is unstable under small
+probability errors, so the noise must be order-free (Gumbel). Whether the noise-to-token
+map is learnable at scale is the open question this experiment answers.
+
+---
+
+### 2.8 Baselines: DBLAST (re-implementation) and original DFlash
+
+**DBLAST** (Karimi, Gao, Hassanpour 2026, arXiv:2608.05448) is re-implemented from the
+paper on the Orthrus diffusion drafter (`src/dblast.py`, `--objective dblast-al|dblast-nll`):
+
+- K category expanders \(h_{i,z}=h_i+g_z(h_i)\) plus a category prior head on the block
+  anchor state (+\(KH^2+2KH+K\) parameters).
+- The AL objective on target-sampled prefixes, with the stop-gradient τ-truncated set.
+- The greedy-branch decoder with the consistent-branch verification conditional
+  (exactly lossless, checked by enumeration).
+
+The paper's four arms map to:
+
+| paper | here |
+|---|---|
+| DFlash (K=1, NLL) | `--objective ce`, eval with `--greedy-branch-drafts` |
+| DFlash + AL (K=1) | `--objective dblast-al --dblast-k 1` |
+| DFlash + DS (K=4, NLL) | `--objective dblast-nll --dblast-k 4` |
+| DBLAST (K=4, AL) | `--objective dblast-al --dblast-k 4` |
+
+The paper's data: Tulu3 prompts with trajectories at T=0.7, top-p 0.8, top-k 20, and the
+target filtered the same way in the loss (`--eal-temperature 0.7 --dblast-target-top-p 0.8
+--dblast-target-top-k 20`), τ = 0.1, block length 15. Choose Z_T on a held-out 10% split
+(`run_benchmark --dblast-category-temperature`, grid 0.0..1.4). Left open by the paper
+(choices here): expander init (small random), prior init (zero), the anchor state
+(diffusion hidden at offset 0), and the conditional inside A_j during training (soft
+mixture).
+
+**DFlash** is a separate, external drafter and stays in its **original form** (official
+code and checkpoints, `z-lab/dflash`; Qwen3-4B/8B non-thinking, block 16). It is a
+system-level baseline. Run it with its own harness on the same target model, prompts,
+benchmarks, T / top-p / top-k, max tokens and GPU. Compare (i) accepted length per cycle
+excluding the bonus token (framework-independent; `run_benchmark` reports the same
+quantity) and (ii) speedup over plain AR **within the same framework**. Absolute tok/s
+across HF and SGLang/vLLM are not comparable.
 
 ---
 

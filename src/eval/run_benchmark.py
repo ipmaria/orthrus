@@ -46,12 +46,17 @@ def evaluate_task(model, tokenizer, task, args) -> dict:
 
     # passes_per_cycle=2 (diffusion + AR verification) is what makes
     # `acceptance_length` computable; the AR baseline has no cycles.
-    orthrus_stats = RunStats("orthrus", passes_per_cycle=2)
+    # Noise-conditioned checkpoints draft twice per cycle at T > 0 (noise-free pass for
+    # the reveal support, then the noise-conditioned pass): 3 passes per cycle.
+    noise_cycle = bool(getattr(model.config, "noise_reveal_top_m", None)) and \
+        args.temperature >= 1e-5
+    orthrus_stats = RunStats("orthrus", passes_per_cycle=3 if noise_cycle else 2)
     baseline_stats = RunStats("autoregressive")
     orthrus_correct = baseline_correct = 0
     identical = mismatched = 0
     samples = []
 
+    model._acceptance_log = []          # (accepted, drafted) per cycle, from generate()
     for index, row in enumerate(rows):
         prompt = task.build_prompt(row)
         input_ids = build_input_ids(
@@ -62,6 +67,7 @@ def evaluate_task(model, tokenizer, task, args) -> dict:
         output_ids, passes, seconds = generate_orthrus(
             model, input_ids, max_new_tokens,
             temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
+            num_drafts=args.num_drafts,
         )
         orthrus_tokens = output_ids.shape[1] - prompt_len
         orthrus_stats.add(orthrus_tokens, passes, seconds)
@@ -121,6 +127,18 @@ def evaluate_task(model, tokenizer, task, args) -> dict:
         "block_size": model.config.block_size,
         "orthrus": orthrus_stats.as_dict(),
     }
+    cycles = [(a, d) for a, d in model._acceptance_log]
+    model._acceptance_log = None
+    if cycles:
+        # Survival curve P(L >= i | position i was drafted): where acceptance decays.
+        max_depth = max(d for _, d in cycles)
+        survival = []
+        for i in range(1, max_depth + 1):
+            eligible = [a for a, d in cycles if d >= i]
+            survival.append(round(sum(a >= i for a in eligible) / len(eligible), 4))
+        result["orthrus"]["survival"] = survival
+        print("  survival P(L>=i): " + " ".join(f"{v:.2f}" for v in survival[:16])
+              + (" ..." if len(survival) > 16 else ""), flush=True)
     if scored:
         result["accuracy_orthrus"] = round(orthrus_correct / max(1, num_rows), 4)
     if not args.no_baseline:
@@ -185,6 +203,16 @@ def parse_args():
                         "check only.")
     p.add_argument("--top-k", type=int, default=20)
     p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--dblast-category-temperature", type=float, default=None,
+                   help="DBLAST checkpoints: override Z_T (paper: grid 0.0..1.4, chosen on "
+                        "a held-out 10%% split per model and sampling regime).")
+    p.add_argument("--greedy-branch-drafts", action="store_true",
+                   help="Decode a non-DBLAST checkpoint with DBLAST's greedy-branch rule "
+                        "(K = 1: argmax draft + stochastic verification), as the paper "
+                        "does for its DFlash baselines.")
+    p.add_argument("--num-drafts", type=int, default=1,
+                   help="Drafts verified as a tree per cycle (stochastic decoding only; "
+                        "needs --attn-implementation sdpa or eager).")
     p.add_argument("--block-size", type=int, default=None,
                    help="Override K at inference (Section 5 ablation).")
     p.add_argument("--no-thinking", dest="enable_thinking", action="store_false",
@@ -220,6 +248,10 @@ def main():
         attn_implementation=args.attn_implementation,
         device=args.device, block_size=args.block_size,
     )
+    if args.greedy_branch_drafts and not getattr(model.config, "dblast_num_categories", None):
+        model.config.dblast_num_categories = 1      # DBLAST's decoder with K = 1 (DFlash)
+    if args.dblast_category_temperature is not None:
+        model.config.dblast_category_temperature = args.dblast_category_temperature
     print(f"Loaded {args.model_dir} | block_size={model.config.block_size} | "
           f"device={model.device} | dtype={args.dtype}")
 

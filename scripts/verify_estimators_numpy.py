@@ -9,7 +9,11 @@ central finite differences:
   * multidraft tree verification: unbiased value and gradient, and its gain over one draft;
   * the coupling identity behind expected-rounds: averaging the occupancy recursion over
     teacher rollouts equals the exact expected number of speculative-decoding rounds;
-  * gradient variance of onpolicy vs rb vs target-path-on-teacher-rollouts.
+  * gradient variance of onpolicy vs rb vs target-path-on-teacher-rollouts;
+  * losslessness of the tree verifier (src/tree_verify.py): exact output law = target;
+  * noise-conditioned drafting (src/noise_coupling.py): posterior Gumbel sampler, the
+    revealed law p(.|G_S), and a full decoding round with a causal noise-conditioned
+    drafter (lossless; training estimator unbiased), plus the non-causal counterexample.
 """
 
 import itertools
@@ -336,3 +340,159 @@ for y in paths:
     tp.append((px[y], fd_grad(lambda th: tp_surr(th,y),theta0)))
 for n,it in (("onpolicy-sampled",samp),("rb",rb),("target-path@rollouts",tp)):
     b,v=stats(it); print(f"{n:22s} bias={b:.1e} grad-var(trace)={v:.4f}")
+
+# ----------------------------------------------------------------- tree losslessness
+rng = np.random.default_rng(5)
+for (N, D, V) in [(1,2,3), (2,2,3), (3,2,2), (2,3,2)]:
+    ptab = {pre: softmax(rng.normal(size=V)*1.3) for t in range(D+2) for pre in itertools.product(range(V), repeat=t)}
+    Q = softmax(rng.normal(size=(D, V))*1.3)
+    out = {}
+    def add(seq, prob):
+        # complete to length D+1 with the exact target law (later rounds are lossless)
+        if len(seq) >= D+1:
+            out[seq[:D+1]] = out.get(seq[:D+1], 0) + prob; return
+        p = ptab[seq]
+        for v in range(V): add(seq+(v,), prob*p[v])
+    def walk(chains, prob):
+        # recursion over depth / candidates with exact branch probabilities
+        def depth(s, alive, committed, prob):
+            if s == D:
+                p = ptab[committed]
+                for v in range(V): add(committed+(v,), prob*p[v])
+                return
+            base = ptab[committed]; residual = base.copy(); q = Q[s]
+            def cand(j, residual, prob):
+                if j == len(alive):
+                    for v in range(V): add(committed+(v,), prob*residual[v])
+                    return
+                c = alive[j]; v = chains[c][s]
+                ratio = min(1.0, residual[v]/q[v])
+                if ratio > 0:
+                    depth(s+1, [cc for cc in alive if chains[cc][s]==v], committed+(v,), prob*ratio)
+                if ratio < 1:
+                    r = np.maximum(residual-q, 0); m = r.sum()
+                    cand(j+1, r/m if m > 1e-15 else base, prob*(1-ratio))
+            cand(0, residual, prob)
+        depth(0, list(range(N)), (), prob)
+    for flat in itertools.product(range(V), repeat=N*D):
+        chains = [flat[c*D:(c+1)*D] for c in range(N)]
+        walk(chains, np.prod([Q[s, chains[c][s]] for c in range(N) for s in range(D)]))
+    err = 0.0
+    for seq in itertools.product(range(V), repeat=D+1):
+        target = np.prod([ptab[seq[:t]][seq[t]] for t in range(D+1)])
+        err = max(err, abs(out.get(seq, 0)-target))
+    print(f"N={N} D={D} V={V}: max |P_tree - P_target| = {err:.2e}  total={sum(out.values()):.12f}")
+
+# ----------------------------------------------------------------- noise conditioning
+rng = np.random.default_rng(0)
+V = 6
+p = np.exp(rng.normal(size=V) * 1.3); p /= p.sum(); logp = np.log(p)
+
+def gumbel(size, loc=0.0): return loc - np.log(-np.log(rng.uniform(size=size)))
+
+def posterior(logp, x, n):
+    """G | argmax(logp + G) = x, for n independent draws (full vocabulary)."""
+    M = gumbel(n)                                   # max of logp+G ~ Gumbel(logsumexp)=Gumbel(0)
+    phi = gumbel((n, V), loc=logp)                  # untruncated perturbed scores
+    trunc = -np.log(np.exp(-M)[:, None] + np.exp(-phi))   # Gumbel(logp) truncated below M
+    trunc[:, x] = M
+    return trunc - logp
+
+# (a) x ~ p then G ~ posterior  =>  G ~ iid Gumbel(0), argmax reproduces x
+n = 400000
+xs = rng.choice(V, size=n, p=p)
+G = np.empty((n, V))
+for v in range(V):
+    idx = np.where(xs == v)[0]
+    G[idx] = posterior(logp, v, len(idx))
+print("argmax reproduces x:", np.all(np.argmax(logp + G, 1) == xs))
+print("mean (want 0.5772):", G.mean(0).round(3), " var (want 1.645):", G.var(0).round(3))
+print("max |corr| off-diagonal:", np.abs(np.corrcoef(G.T) - np.eye(V)).max().round(4))
+
+# (b) closed-form law P(x | G_S) vs Monte Carlo over the unrevealed noise
+def law(logp, G, S):
+    S = np.asarray(S); p = np.exp(logp)
+    scores = logp[S] + G[S]; vstar = S[np.argmax(scores)]; s = scores.max()
+    out = np.ones(V, bool); out[S] = False; pout = p[out].sum()
+    w = np.exp(-pout * np.exp(-s)) if pout > 0 else 1.0
+    L = np.zeros(V); L[out] = (1 - w) * p[out] / max(pout, 1e-300); L[vstar] += w
+    return L
+S = [1, 4]
+for trial in range(3):
+    g = gumbel(V)
+    Gs = gumbel((200000, V)); Gs[:, S] = g[S]
+    emp = np.bincount(np.argmax(logp + Gs, 1), minlength=V) / len(Gs)
+    print("law vs MC max err:", np.abs(law(logp, g, S) - emp).max().round(4))
+
+# (c) sampling the posterior only on S u {x} matches the full posterior's marginal on S
+x = 2
+full = posterior(logp, x, 200000)[:, S]
+M = gumbel(200000)
+part = np.stack([(-np.log(np.exp(-M) + np.exp(-gumbel(200000, loc=logp[v])))) - logp[v]
+                 for v in S], 1)
+print("restricted posterior: mean diff", np.abs(full.mean(0) - part.mean(0)).round(3),
+      " std diff", np.abs(full.std(0) - part.std(0)).round(3))
+
+
+def noise_round(causal, n):
+    rng = np.random.default_rng(2)
+    V, D, m = 4, 3, 2
+    def softmax(z): z = z - z.max(-1, keepdims=True); e = np.exp(z); return e / e.sum(-1, keepdims=True)
+    def gumbel(size, loc=0.0): return loc - np.log(-np.log(rng.uniform(size=size)))
+    P0 = softmax(rng.normal(size=V) * 1.5); T = softmax(rng.normal(size=(V, V)) * 1.5)
+    cond = lambda pre: P0 if not pre else T[pre[-1]]
+    S = [np.argsort(-rng.normal(size=V))[:m] for _ in range(D)]        # fixed noise-free supports
+    theta = rng.normal(size=(D, V)); A = rng.normal(size=(D, D, m)) * 1.5
+    if causal:  # q_s may only see the revealed noise of positions <= s
+        A = A * (np.arange(D)[None, :, None] <= np.arange(D)[:, None, None])
+
+    def law(p, G, Ss):
+        sc = np.log(p[Ss]) + G; vs = Ss[np.argmax(sc)]; s = sc.max()
+        out = np.ones(V, bool); out[Ss] = False; po = p[out].sum(); w = np.exp(-po * np.exp(-s))
+        L = np.zeros(V); L[out] = (1 - w) * p[out] / po; L[vs] += w; return L
+
+    def drafter(G):                       # q_s depends on the noise of every position
+        q = theta.copy()
+        for s in range(D):
+            for j in range(D):
+                q[s, S[j]] += A[s, j] * G[j]
+        return softmax(q)
+
+    # A) real decoding rounds
+    counts = {}; lengths = []
+    for _ in range(n):
+        G = np.stack([gumbel(m) for _ in range(D)]); q = drafter(G)
+        y = [rng.choice(V, p=q[s]) for s in range(D)]
+        out, acc = [], 0
+        for s in range(D):
+            Ls = law(cond(y[:s]), G[s], S[s])
+            if rng.uniform() < min(1, Ls[y[s]] / q[s, y[s]]):
+                out.append(y[s]); acc += 1; continue
+            r = np.maximum(Ls - q[s], 0); out.append(rng.choice(V, p=r / r.sum())); break
+        else:
+            out.append(rng.choice(V, p=cond(out)))
+        while len(out) < D + 1: out.append(rng.choice(V, p=cond(out)))
+        counts[tuple(out[:D + 1])] = counts.get(tuple(out[:D + 1]), 0) + 1; lengths.append(acc)
+    tv = 0.5 * sum(abs(counts.get(x, 0) / n - np.prod([cond(x[:t])[x[t]] for t in range(D + 1)]))
+                   for x in itertools.product(range(V), repeat=D + 1))
+    print(f"[causal={causal}] lossless: TV(output, target) = {tv:.4f}  (MC noise ~ {0.5*np.sqrt(V**(D+1)/n)*0.8:.4f})")
+
+    # B) training estimator: x ~ p, G ~ posterior(.|x) on S, survival with min(1, q/law)
+    def posterior(logp_S, x_in, M):
+        phi = logp_S + gumbel(len(logp_S))
+        tr = -np.logaddexp(-M, -phi); tr[x_in] = M; return tr - logp_S
+    est = []
+    for _ in range(n):
+        x = []
+        for s in range(D): x.append(rng.choice(V, p=cond(x)))
+        G = np.stack([posterior(np.log(cond(x[:s])[S[s]]), S[s] == x[s], gumbel(1)[0]) for s in range(D)])
+        q = drafter(G); f = 1.0; j = 0.0
+        for s in range(D):
+            f *= min(1.0, q[s, x[s]] / law(cond(x[:s]), G[s], S[s])[x[s]]); j += f
+        est.append(j)
+    print(f"E[accepted]: decoding {np.mean(lengths):.4f} ± {np.std(lengths)/np.sqrt(n):.4f} | "
+          f"training estimator {np.mean(est):.4f} ± {np.std(est)/np.sqrt(len(est)):.4f}")
+
+
+noise_round(causal=False, n=150000)
+noise_round(causal=True, n=150000)

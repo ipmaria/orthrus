@@ -37,6 +37,8 @@ from src.model import OrthrusLM
 DIFF_PARAM_SUFFIXES = (
     "q_proj_diff", "k_proj_diff", "v_proj_diff", "o_proj_diff",
     "q_norm_diff", "k_norm_diff",
+    "noise_proj_diff",  # noise-conditioned drafting (only present when enabled)
+    "dblast_expander_diff", "dblast_prior_diff",  # DBLAST heads (only when enabled)
 )
 
 REMOTE_CODE_FILENAME = "modeling_orthrus.py"

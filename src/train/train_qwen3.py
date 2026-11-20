@@ -62,10 +62,14 @@ from src.train.checkpoint import (
     save_checkpoint,
     save_final,
 )
-from src.train.dual_pass import dual_pass_forward
+from src.train.dual_pass import dual_pass_forward, noise_conditioned_dual_pass
 from src.train.loss_kl import (
     ACCEPTED_LENGTH_ESTIMATORS,
+    BASELINE_OBJECTIVES,
     fused_linear_accepted_length,
+    fused_linear_baseline_loss,
+    fused_linear_conditioned_target_path,
+    fused_linear_dblast,
     fused_linear_cross_entropy,
     fused_linear_expected_rounds,
     fused_linear_forward_kl,
@@ -93,7 +97,9 @@ from src.utils.logging import (
     mix_seed,
 )
 
-STAGE_TWO_OBJECTIVES = ("accepted-length", "expected-rounds")
+DBLAST_TRAIN_OBJECTIVES = ("dblast-al", "dblast-nll")
+STAGE_TWO_OBJECTIVES = ("accepted-length", "expected-rounds", "noise-eal",
+                        *DBLAST_TRAIN_OBJECTIVES, *BASELINE_OBJECTIVES)
 
 try:
     import wandb
@@ -119,6 +125,145 @@ def _lm_head_weight(base_model):
     return weight
 
 
+def _sync_replicated_grads_and_clip(model, replicated, max_norm):
+    """All-reduce (mean) replicated grads, then clip all grads by one global norm."""
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor
+
+    for param in replicated:
+        if param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    if max_norm <= 0:
+        return
+    sharded_sq = torch.zeros((), device=replicated[0].device, dtype=torch.float32)
+    plain_sq = torch.zeros_like(sharded_sq)
+    grads = [q.grad for q in model.parameters() if q.grad is not None]
+    for grad in grads:
+        if isinstance(grad, DTensor):
+            sharded_sq += grad.to_local().float().pow(2).sum()
+        else:
+            plain_sq += grad.float().pow(2).sum()
+    dist.all_reduce(sharded_sq)            # disjoint shards: sum over ranks
+    total = torch.sqrt(sharded_sq + plain_sq)
+    scale = float((max_norm / (total + 1e-6)).clamp(max=1.0))
+    for grad in grads:
+        grad.mul_(scale)
+
+
+def compute_objective_loss(args, model, base_model, cfg, input_ids, assistant_mask,
+                           anchor_gen, sample_gen=None):
+    """Anchors -> dual pass -> loss for one micro-batch (shared with grad_variance.py).
+
+    `anchor_gen` draws the anchors; `sample_gen` (default: the same generator, which is
+    what training uses) draws drafts and accept coins. Passing a separate `sample_gen`
+    keeps the anchors fixed while resampling only the estimator's randomness.
+    Returns `(loss, anchor_valid)`; the loss is not divided by grad accumulation.
+    """
+    sample_gen = anchor_gen if sample_gen is None else sample_gen
+    block_size = cfg.block_size
+    if args.objective == "expected-rounds":
+        anchors, anchor_valid = sample_window_anchors(
+            input_ids, block_size,
+            num_windows=args.num_anchor_blocks // args.rounds_window_len,
+            window_len=args.rounds_window_len,
+            generator=anchor_gen, assistant_mask=assistant_mask,
+        )
+    else:
+        anchors, anchor_valid = sample_batch_anchors(
+            input_ids, block_size, args.num_anchor_blocks,
+            generator=anchor_gen, assistant_mask=assistant_mask,
+        )
+
+    head_weight = _lm_head_weight(base_model)
+    if args.objective in DBLAST_TRAIN_OBJECTIVES:
+        student, teacher, _, labels = dual_pass_forward(
+            model, input_ids=input_ids, anchors=anchors, block_size=block_size,
+            mask_token_id=cfg.mask_token_id, anchor_valid=anchor_valid,
+            supervise_mask=assistant_mask,
+        )
+        expander = getattr(base_model, "dblast_expander_diff", None)
+        prior = getattr(base_model, "dblast_prior_diff", None)
+        loss = fused_linear_dblast(
+            args.objective.removeprefix("dblast-"), head_weight, student, teacher, labels,
+            block_size=block_size, num_categories=args.dblast_k,
+            expander_weight=getattr(expander, "weight", None),
+            expander_bias=getattr(expander, "bias", None),
+            prior_weight=getattr(prior, "weight", None),
+            prior_bias=getattr(prior, "bias", None),
+            tau=args.dblast_tau, temperature=args.eal_temperature,
+            target_top_k=args.dblast_target_top_k, target_top_p=args.dblast_target_top_p,
+            chunk_size=args.loss_chunk_size,
+        )
+        return loss, anchor_valid
+    if args.objective == "noise-eal":
+        student, log_target, _, labels = noise_conditioned_dual_pass(
+            model, input_ids=input_ids, anchors=anchors, block_size=block_size,
+            mask_token_id=cfg.mask_token_id, lm_head_weight=head_weight,
+            embed_weight=base_model.model.embed_tokens.weight,
+            top_m=args.noise_reveal_top_m, anchor_valid=anchor_valid,
+            supervise_mask=assistant_mask, temperature=args.eal_temperature,
+            generator=sample_gen, chunk_size=args.loss_chunk_size,
+        )
+        loss = fused_linear_conditioned_target_path(
+            head_weight, student, log_target, labels, block_size=block_size,
+            chunk_size=args.loss_chunk_size, temperature=args.eal_temperature,
+        )
+        return loss, anchor_valid
+
+    on_policy_eal = (
+        args.objective == "accepted-length" and args.eal_estimator != "target-path"
+    )
+    num_drafts = args.eal_num_drafts if on_policy_eal else 1
+    student, teacher, keep_mask, labels = dual_pass_forward(
+        model,
+        input_ids=input_ids,
+        anchors=anchors,
+        block_size=block_size,
+        mask_token_id=cfg.mask_token_id,
+        anchor_valid=anchor_valid,
+        supervise_mask=assistant_mask,
+        on_policy=on_policy_eal,
+        lm_head_weight=head_weight,
+        sampling_temperature=args.eal_temperature,
+        sampling_generator=sample_gen,
+        sampling_chunk_size=args.loss_chunk_size,
+        num_drafts=num_drafts,
+        causal_drafting=args.causal_drafting,
+    )
+
+    if args.objective == "kl":
+        loss = fused_linear_forward_kl(
+            head_weight, student, teacher, keep_mask, chunk_size=args.loss_chunk_size,
+        )
+    elif args.objective == "accepted-length":
+        loss = fused_linear_accepted_length(
+            head_weight, student, teacher, labels,
+            block_size=block_size, chunk_size=args.loss_chunk_size,
+            temperature=args.eal_temperature,
+            estimator=args.eal_estimator,
+            num_drafts=num_drafts,
+            baseline=args.eal_baseline,
+            generator=sample_gen,
+        )
+    elif args.objective == "expected-rounds":
+        loss = fused_linear_expected_rounds(
+            head_weight, student, teacher, labels,
+            block_size=block_size, window_len=args.rounds_window_len,
+            chunk_size=args.loss_chunk_size, temperature=args.eal_temperature,
+        )
+    elif args.objective in BASELINE_OBJECTIVES:
+        loss = fused_linear_baseline_loss(
+            args.objective, head_weight, student, teacher, labels,
+            block_size=block_size, chunk_size=args.loss_chunk_size,
+            temperature=args.eal_temperature, lk_eta=args.lk_eta, lk_gamma=args.lk_gamma,
+        )
+    else:
+        loss = fused_linear_cross_entropy(
+            head_weight, student, labels, chunk_size=args.loss_chunk_size,
+        )
+    return loss, anchor_valid
+
+
 def shard_decoder_layers(model, activation_checkpointing: bool) -> list:
     """FSDP2 over the decoder layers only, leaving root parameters replicated.
 
@@ -131,8 +276,9 @@ def shard_decoder_layers(model, activation_checkpointing: bool) -> list:
 
     Leaving the root replicated costs one copy of the frozen embedding / head per rank
     (~2.5 GB for Qwen3-8B) and nothing in optimizer state, since every root parameter is
-    frozen. All trainable parameters live inside the decoder layers, so their gradients
-    are still reduce-scattered by FSDP.
+    frozen. Trainable parameters inside the decoder layers are reduce-scattered by FSDP;
+    trainable ROOT parameters (noise_proj_diff, DBLAST heads) stay replicated and are
+    all-reduced by `_sync_replicated_grads_and_clip` in the training loop.
 
     Returns the sharded modules, for `set_requires_gradient_sync` during accumulation.
     """
@@ -204,7 +350,24 @@ def train(args):
             f"{weights_dir}/config.json is missing block_size or mask_token_id; build the "
             f"init checkpoint with `python -m src.utils.init_model_qwen3`."
         )
+    had_noise_projection = bool(getattr(cfg, "noise_reveal_top_m", None))
+    if args.objective == "noise-eal":
+        cfg.noise_reveal_top_m = args.noise_reveal_top_m
+    had_dblast_heads = (getattr(cfg, "dblast_num_categories", None) or 1) > 1
+    if args.objective in DBLAST_TRAIN_OBJECTIVES:
+        cfg.dblast_num_categories = args.dblast_k
+        cfg.dblast_init_scale = args.dblast_init_scale
+    if args.causal_drafting:
+        cfg.causal_drafting = True      # saved, so generate() drafts causally too
     model = OrthrusLM.from_pretrained(weights_dir, config=cfg, dtype=dtype)
+    if args.objective in DBLAST_TRAIN_OBJECTIVES and args.dblast_k > 1 and not had_dblast_heads:
+        model.reset_dblast_heads()
+        log_main(is_main, f"DBLAST: initialized K={args.dblast_k} expander/prior heads.")
+    if args.objective == "noise-eal" and not had_noise_projection:
+        # New module on an old checkpoint: start exactly at the noise-free model.
+        torch.nn.init.zeros_(model.noise_proj_diff.weight)
+        log_main(is_main, "Noise conditioning: zero-initialized noise_proj_diff "
+                          f"(reveal top-{args.noise_reveal_top_m}).")
 
     if resume_dir is None:
         if args.objective in STAGE_TWO_OBJECTIVES:
@@ -252,6 +415,15 @@ def train(args):
     elif distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     base_model = model.module if (distributed and not args.fsdp2) else model
+    replicated_trainable = []
+    if distributed and args.fsdp2:
+        from torch.distributed.tensor import DTensor
+        replicated_trainable = [
+            q for q in model.parameters() if q.requires_grad and not isinstance(q, DTensor)
+        ]
+        if replicated_trainable:
+            log_main(is_main, f"FSDP2: {len(replicated_trainable)} replicated trainable root "
+                              "parameter tensors; their gradients are all-reduced manually.")
 
     wandb_run = None
     if args.wandb and is_main:
@@ -270,6 +442,13 @@ def train(args):
         "ce": "Table 5 ablation arm: hard-label cross-entropy",
         "accepted-length": "stage 2: negative accepted length (stochastic decoding)",
         "expected-rounds": "stage 2: expected verification rounds per token (multi-round)",
+        "noise-eal": "stage 2: noise-conditioned drafting, EAL vs revealed laws",
+        "dblast-al": "stage-2 baseline: DBLAST (re-impl.), latent mixture + AL loss",
+        "dblast-nll": "stage-2 baseline: DBLAST dependent NLL (DFlash+DS when K>1)",
+        "lk": "stage-2 baseline: LK^alpha, -log acceptance per position",
+        "lk-hybrid": "stage-2 baseline: LK^lambda, adaptive KL/TV blend",
+        "wtv": "stage-2 baseline: window TV, -sum prod (1 - TV) on the committed path",
+        "streak": "stage-2 baseline: SpecDiff-2 streak distillation",
     }[args.objective]
     log_main(is_main, f"Objective | {args.objective.upper()}  ({objective_description})")
     if args.objective == "accepted-length":
@@ -359,67 +538,9 @@ def train(args):
 
             with amp_context():
                 anchor_gen.manual_seed(mix_seed(args.seed, epoch, rank, batch_idx))
-                if args.objective == "expected-rounds":
-                    anchors, anchor_valid = sample_window_anchors(
-                        input_ids, block_size,
-                        num_windows=args.num_anchor_blocks // args.rounds_window_len,
-                        window_len=args.rounds_window_len,
-                        generator=anchor_gen, assistant_mask=assistant_mask,
-                    )
-                else:
-                    anchors, anchor_valid = sample_batch_anchors(
-                        input_ids, block_size, args.num_anchor_blocks,
-                        generator=anchor_gen, assistant_mask=assistant_mask,
-                    )
-
-                head_weight = _lm_head_weight(base_model)
-                on_policy_eal = (
-                    args.objective == "accepted-length"
-                    and args.eal_estimator != "target-path"
+                loss, anchor_valid = compute_objective_loss(
+                    args, model, base_model, cfg, input_ids, assistant_mask, anchor_gen,
                 )
-                num_drafts = args.eal_num_drafts if on_policy_eal else 1
-                student, teacher, keep_mask, labels = dual_pass_forward(
-                    model,
-                    input_ids=input_ids,
-                    anchors=anchors,
-                    block_size=block_size,
-                    mask_token_id=cfg.mask_token_id,
-                    anchor_valid=anchor_valid,
-                    supervise_mask=assistant_mask,
-                    on_policy=on_policy_eal,
-                    lm_head_weight=head_weight,
-                    sampling_temperature=args.eal_temperature,
-                    sampling_generator=anchor_gen,
-                    sampling_chunk_size=args.loss_chunk_size,
-                    num_drafts=num_drafts,
-                )
-
-                if args.objective == "kl":
-                    loss = fused_linear_forward_kl(
-                        head_weight, student, teacher, keep_mask,
-                        chunk_size=args.loss_chunk_size,
-                    )
-                elif args.objective == "accepted-length":
-                    loss = fused_linear_accepted_length(
-                        head_weight, student, teacher, labels,
-                        block_size=block_size, chunk_size=args.loss_chunk_size,
-                        temperature=args.eal_temperature,
-                        estimator=args.eal_estimator,
-                        num_drafts=num_drafts,
-                        baseline=args.eal_baseline,
-                        generator=anchor_gen,
-                    )
-                elif args.objective == "expected-rounds":
-                    loss = fused_linear_expected_rounds(
-                        head_weight, student, teacher, labels,
-                        block_size=block_size, window_len=args.rounds_window_len,
-                        chunk_size=args.loss_chunk_size,
-                        temperature=args.eal_temperature,
-                    )
-                else:
-                    loss = fused_linear_cross_entropy(
-                        head_weight, student, labels, chunk_size=args.loss_chunk_size,
-                    )
                 loss = loss / args.grad_accum_steps
 
             is_sync_step = (batch_idx + 1) % args.grad_accum_steps == 0
@@ -438,7 +559,14 @@ def train(args):
             if not is_sync_step:
                 continue
 
-            if args.max_grad_norm > 0:
+            if replicated_trainable:
+                # FSDP2 shards only the decoder layers: trainable ROOT parameters (the
+                # noise projection, DBLAST heads) are plain replicated tensors whose
+                # gradients FSDP never reduces. Average them here, and clip over both
+                # kinds together (clip_grad_norm_ cannot mix DTensor and Tensor).
+                _sync_replicated_grads_and_clip(model, replicated_trainable,
+                                                args.max_grad_norm)
+            elif args.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             scheduler.step()
@@ -529,13 +657,40 @@ def parse_args():
                         "OrthrusModel.forward builds a real causal mask for them.")
     # Objective
     p.add_argument("--objective", type=str, default="kl",
-                   choices=["kl", "ce", "accepted-length", "expected-rounds"],
+                   choices=["kl", "ce", "accepted-length", "expected-rounds",
+                            "noise-eal", *DBLAST_TRAIN_OBJECTIVES, *BASELINE_OBJECTIVES],
                    help="kl = paper Eq. 7 (forward KL vs the frozen AR head). "
                         "ce = the hard-label arm ablated in Table 5. "
                         "accepted-length = stage-2 on-policy EAL from an existing "
                         "CE/KL diffusion checkpoint (stochastic decoding). "
                         "expected-rounds = stage-2 multi-round objective (expected "
-                        "verification rounds per token over contiguous anchor windows).")
+                        "verification rounds per token over contiguous anchor windows). "
+                        "lk / lk-hybrid / wtv / streak = published stage-2 baselines on the "
+                        "committed path (see loss_kl.py).")
+    p.add_argument("--noise-reveal-top-m", type=int, default=32,
+                   help="noise-eal: reveal the verifier's Gumbel noise on the top-m "
+                        "tokens of the noise-free proposal (saved in the config and "
+                        "used by generate()). Train on teacher rollouts at "
+                        "--eal-temperature.")
+    p.add_argument("--causal-drafting", action="store_true",
+                   help="Control arm: causal in-block mask in the diffusion pass (as "
+                        "noise-eal uses), without any noise. Saved in the config.")
+    p.add_argument("--dblast-k", type=int, default=4,
+                   help="DBLAST categories K (1 = independent drafter, i.e. 'DFlash+AL' "
+                        "with dblast-al).")
+    p.add_argument("--dblast-tau", type=float, default=0.1,
+                   help="DBLAST AL threshold tau on r_l = q(x_1:l)/p(x_1:l).")
+    p.add_argument("--dblast-target-top-k", type=int, default=20,
+                   help="Target filter used to generate the trajectories (paper: 20).")
+    p.add_argument("--dblast-target-top-p", type=float, default=0.8,
+                   help="Target filter used to generate the trajectories (paper: 0.8; "
+                        "with --eal-temperature 0.7).")
+    p.add_argument("--dblast-init-scale", type=float, default=0.01,
+                   help="Expander init std x sqrt(hidden) (paper: unspecified).")
+    p.add_argument("--lk-eta", type=float, default=3.0,
+                   help="lk-hybrid: lambda_j = exp(-eta * mean acceptance at offset j).")
+    p.add_argument("--lk-gamma", type=float, default=0.8,
+                   help="lk / lk-hybrid: weight gamma^j of block offset j.")
     p.add_argument("--loss-chunk-size", type=int, default=1024,
                    help="Positions per recomputed logit chunk. Peak activation memory is "
                         "~4 x chunk x vocab x 4B; lower it if the loss OOMs.")
@@ -602,6 +757,14 @@ def parse_args():
         raise ValueError("--micro-batch-size must be > 0.")
     if not 0.0 < args.eal_temperature < float("inf"):
         raise ValueError("--eal-temperature must be finite and positive.")
+    if args.causal_drafting and args.objective in ("noise-eal", *DBLAST_TRAIN_OBJECTIVES):
+        raise ValueError("--causal-drafting is the control for plain stage-2 objectives.")
+    if args.objective in DBLAST_TRAIN_OBJECTIVES and (
+        args.dblast_k < 1 or not 0.0 < args.dblast_tau < 1.0
+    ):
+        raise ValueError("--dblast-k must be >= 1 and --dblast-tau in (0, 1).")
+    if args.objective == "noise-eal" and args.noise_reveal_top_m < 1:
+        raise ValueError("--noise-reveal-top-m must be >= 1.")
     if args.eal_num_drafts < 1:
         raise ValueError("--eal-num-drafts must be >= 1.")
     if args.eal_estimator == "target-path" and args.eal_num_drafts != 1:

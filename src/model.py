@@ -16,6 +16,28 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
 
+try:
+    from src.tree_verify import tree_speculative_walk, tree_verification_mask
+except ImportError:  # loaded as a standalone file (e.g. remote code next to tree_verify.py)
+    try:
+        from .tree_verify import tree_speculative_walk, tree_verification_mask
+    except ImportError:
+        tree_speculative_walk = tree_verification_mask = None
+try:
+    from src import dblast
+except ImportError:
+    try:
+        from . import dblast
+    except ImportError:
+        dblast = None
+try:
+    from src import noise_coupling
+except ImportError:
+    try:
+        from . import noise_coupling
+    except ImportError:
+        noise_coupling = None
+
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding as OrthrusRotaryEmbedding,
     Qwen3Config as OrthrusConfig,
@@ -176,6 +198,10 @@ class OrthrusAttention(Qwen3Attention):
             value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if is_verification_pass and getattr(self, "_stash_verification_kv", False):
+            # Tree decoding copies the accepted chain's K/V into the cache from here,
+            # instead of re-running the AR pass over the accepted tokens.
+            self._stashed_kv = (key_states, value_states)
         
         shared_cache = past_key_values.layers[self.layer_idx]
         shared_key_states = shared_cache.keys
@@ -294,6 +320,7 @@ class OrthrusModel(OrthrusPreTrainedModel):
         is_verification_pass: bool = False,
         causal_limit: torch.Tensor | None = None,
         ar_seq_len: int | None = None,
+        causal_within_block: bool = False,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         
@@ -330,7 +357,10 @@ class OrthrusModel(OrthrusPreTrainedModel):
                 ar_len=ar_seq_len,
                 block_size=self.config.block_size,
                 causal_limit=causal_limit,
-                causal_within_block=is_verification_pass,
+                # Noise-conditioned drafting needs a causal diffusion pass: a draft
+                # position may only see the revealed noise of positions <= its own,
+                # otherwise verification is no longer lossless (src/noise_coupling.py).
+                causal_within_block=is_verification_pass or causal_within_block,
             )
         
         if is_diffusion_pass or is_verification_pass or self.config._attn_implementation not in ["eager", "sdpa"]:
@@ -378,7 +408,43 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
         self.model = OrthrusModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Noise-conditioned drafting (src/noise_coupling.py): maps the revealed-noise
+        # features of a block position into its diffusion input embedding. Zero-init,
+        # so enabling it on an existing checkpoint changes nothing until trained.
+        if getattr(config, "noise_reveal_top_m", None):
+            self.noise_proj_diff = nn.Linear(2 * config.hidden_size, config.hidden_size,
+                                             bias=False)
+        # DBLAST heads (src/dblast.py): K category expanders (one fused linear, with
+        # bias) and the category prior head on the block-anchor state.
+        num_categories = getattr(config, "dblast_num_categories", None) or 1
+        if num_categories > 1:
+            self.dblast_expander_diff = nn.Linear(
+                config.hidden_size, num_categories * config.hidden_size, bias=True)
+            self.dblast_prior_diff = nn.Linear(config.hidden_size, num_categories, bias=True)
         self.post_init()
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if module is getattr(self, "noise_proj_diff", None):
+            nn.init.zeros_(module.weight)
+        if module is getattr(self, "dblast_expander_diff", None):
+            scale = getattr(self.config, "dblast_init_scale", 0.01) / self.config.hidden_size ** 0.5
+            nn.init.normal_(module.weight, std=scale)
+            nn.init.zeros_(module.bias)
+        if module is getattr(self, "dblast_prior_diff", None):
+            nn.init.zeros_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def reset_dblast_heads(self):
+        """Expander: small random (branches near the base drafter, not identical);
+        prior: zero (uniform). The paper leaves the initialization unspecified."""
+        hidden = self.config.hidden_size
+        scale = getattr(self.config, "dblast_init_scale", 0.01) / hidden ** 0.5
+        with torch.no_grad():
+            nn.init.normal_(self.dblast_expander_diff.weight, std=scale)
+            nn.init.zeros_(self.dblast_expander_diff.bias)
+            nn.init.zeros_(self.dblast_prior_diff.weight)
+            nn.init.zeros_(self.dblast_prior_diff.bias)
 
     def forward(
         self,
@@ -395,11 +461,24 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
         is_verification_pass: bool = False,
         causal_limit: torch.Tensor | None = None,
         ar_seq_len: int | None = None,
+        noise_features: torch.Tensor | None = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         
+        if noise_features is not None:
+            # Diffusion pass with revealed verifier noise: [batch, len, 2*hidden],
+            # zeros where nothing is revealed (the anchor-free last offset).
+            if not is_diffusion_pass:
+                raise ValueError("noise_features is only defined for the diffusion pass.")
+            embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = embeds + self.noise_proj_diff(noise_features.to(embeds.dtype))
+            input_ids = None
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
+            # Only the packed verification pass needs an explicit (tree) mask. The AR
+            # path keeps ignoring it, exactly as before this change.
+            attention_mask=attention_mask if (is_diffusion_pass or is_verification_pass)
+            else None,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -424,6 +503,62 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
         
+    def _tree_verify_round(self, anchor_token, draft_probs, block_position_ids,
+                           past_key_values, start_idx, num_drafts, sample):
+        """Sample N drafts, verify them in ONE packed AR pass, commit the accepted chain.
+
+        anchor_token: [1, 1]; draft_probs: [D, V] (already top-k/top-p processed);
+        block_position_ids: [1, D+1]. The cache holds positions < start_idx on entry and
+        < start_idx + accepted + 1 on exit (the accepted chain's own K/V are copied from
+        the verification pass, so no extra forward is needed).
+        Returns (acceptance_len, next_token [1], proposed_block [1, D+1]).
+        """
+        if tree_speculative_walk is None:
+            raise ImportError("num_drafts > 1 needs src/tree_verify.py next to the model.")
+        if self.config._attn_implementation not in ("sdpa", "eager"):
+            raise ValueError("tree verification needs an explicit 4-D mask: load the model "
+                             "with attn_implementation='sdpa' (or 'eager').")
+        block_len = draft_probs.shape[0] + 1
+        chains = torch.multinomial(draft_probs.float(), num_drafts, replacement=True).T
+        blocks = torch.cat([anchor_token.expand(num_drafts, 1), chains], dim=1)
+        mask = tree_verification_mask(
+            num_drafts, block_len, start_idx, dtype=self.model.embed_tokens.weight.dtype,
+            device=blocks.device,
+        )
+        attention_modules = [
+            layer.self_attn for layer in self.model.layers[: self.config.num_hidden_layers]
+        ]
+        for module in attention_modules:
+            module._stash_verification_kv = True
+        try:
+            outputs = self(
+                input_ids=blocks.reshape(1, num_drafts * block_len),
+                position_ids=block_position_ids.repeat(1, num_drafts),
+                past_key_values=past_key_values,
+                attention_mask=mask,
+                use_cache=False,
+                is_verification_pass=True,
+                ar_seq_len=start_idx,
+            )
+            logits = outputs.logits.reshape(num_drafts, block_len, -1)
+            _, target_probs = sample(logits)
+            chain, acceptance_len, next_token = tree_speculative_walk(
+                chains, draft_probs, target_probs
+            )
+            lo = chain * block_len
+            hi = lo + acceptance_len + 1
+            for module in attention_modules:
+                keys, values = module._stashed_kv
+                past_key_values.update(
+                    keys[:, :, lo:hi].contiguous(), values[:, :, lo:hi].contiguous(),
+                    module.layer_idx,
+                )
+        finally:
+            for module in attention_modules:
+                module._stash_verification_kv = False
+                module._stashed_kv = None
+        return acceptance_len, next_token.reshape(1), blocks[chain:chain + 1]
+
     @torch.inference_mode()
     def generate(
         self,
@@ -436,6 +571,7 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
         eos_token_id: Optional[int] = None,
         streamer: Optional[TextStreamer] = None,
         use_diffusion_mode: bool = True,
+        num_drafts: int = 1,
         **kwargs,
     ) -> torch.LongTensor:
         eos_token_id = eos_token_id or getattr(self.config, "eos_token_id", None)
@@ -504,7 +640,13 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
             diff_block_ids[:, 0] = output_ids[:, start_idx]
             diff_position_ids = torch.arange(start_idx, start_idx + diff_len, device=device).unsqueeze(0)
 
-            # Diffusion Path
+            # Diffusion Path (causal within the block for --causal-drafting checkpoints)
+            causal_draft_mask = None
+            if getattr(self.config, "causal_drafting", False):
+                causal_draft_mask = tree_verification_mask(
+                    1, diff_len, start_idx, dtype=self.model.embed_tokens.weight.dtype,
+                    device=device,
+                )
             diff_outputs = self(
                 input_ids=diff_block_ids,
                 position_ids=diff_position_ids,
@@ -512,47 +654,129 @@ class OrthrusLM(OrthrusPreTrainedModel, GenerationMixin):
                 use_cache=False,
                 is_diffusion_pass=True,
                 ar_seq_len=start_idx,
+                attention_mask=causal_draft_mask,
             )
             
-            if diff_len > 1:
+            noise_reveal = None
+            if (getattr(self.config, "noise_reveal_top_m", None) and temperature >= 1e-5
+                    and diff_len > 1):
+                if num_drafts > 1:
+                    raise ValueError("noise-conditioned decoding verifies one draft; "
+                                     "use num_drafts=1.")
+                # Support from the noise-free proposal (independent of the noise), then
+                # reveal the verifier's Gumbel noise there and draft again.
+                support = (diff_outputs.logits[0, :-1].float() / temperature).topk(
+                    self.config.noise_reveal_top_m, dim=-1).indices          # [D, m]
+                gumbel = noise_coupling.sample_gumbel(support.shape, device=device)
+                features = noise_coupling.noise_features(
+                    self.model.embed_tokens.weight, support, gumbel)
+                features = torch.cat([features, features.new_zeros(1, features.shape[-1])])
+                if self.config._attn_implementation not in ("sdpa", "eager"):
+                    raise ValueError("noise-conditioned decoding needs a causal in-block "
+                                     "mask: use attn_implementation='sdpa' or 'eager'.")
+                # Causal within the block: position i sees only noise of positions <= i.
+                causal_block_mask = tree_verification_mask(
+                    1, diff_len, start_idx, dtype=self.model.embed_tokens.weight.dtype,
+                    device=device,
+                )
+                diff_outputs = self(
+                    input_ids=diff_block_ids,
+                    position_ids=diff_position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=False,
+                    is_diffusion_pass=True,
+                    ar_seq_len=start_idx,
+                    attention_mask=causal_block_mask,
+                    noise_features=features.unsqueeze(0),
+                )
+                noise_reveal = (support, gumbel)
+
+            dblast_state = None
+            dblast_k = getattr(self.config, "dblast_num_categories", None)
+            if dblast_k and temperature >= 1e-5 and diff_len > 1:
+                if num_drafts > 1 or noise_reveal is not None:
+                    raise ValueError("DBLAST decoding cannot be combined with tree or "
+                                     "noise-conditioned decoding.")
+                # Greedy-branch decoder: per-branch argmax drafts, z ~ softmax(prior/Z_T).
+                hidden = diff_outputs.hidden_states[0][0, :-1]                    # [D, H]
+                expander = getattr(self, "dblast_expander_diff", None)
+                prior = getattr(self, "dblast_prior_diff", None)
+                branches = dblast.branch_hidden(
+                    hidden, getattr(expander, "weight", None), getattr(expander, "bias", None),
+                    dblast_k)
+                branch_tokens = self.lm_head(branches).argmax(dim=-1).T            # [K, D]
+                if dblast_k == 1:
+                    category_probs = torch.ones(1, device=device)
+                else:
+                    prior_logits = prior(hidden[0]).float()
+                    z_temperature = getattr(self.config, "dblast_category_temperature", 1.0)
+                    if z_temperature <= 0:
+                        category_probs = F.one_hot(prior_logits.argmax(), dblast_k).float()
+                    else:
+                        category_probs = torch.softmax(prior_logits / z_temperature, dim=-1)
+                chosen = int(torch.multinomial(category_probs, 1))
+                diff_tokens = branch_tokens[chosen].unsqueeze(0)
+                diff_probs = None
+                dblast_state = (branch_tokens, category_probs, chosen)
+            elif diff_len > 1:
                 diff_tokens, diff_probs = sample(diff_outputs.logits[:, :-1, :])
             else:
                 diff_tokens, diff_probs = torch.empty((1, 0), dtype=torch.long, device=device), None
 
             proposed_block = torch.cat([output_ids[:, start_idx:start_idx+1], diff_tokens], dim=1)
 
-            # Autoregressive Path for Intra-model Consistency
-            ar_outputs = self(
-                input_ids=proposed_block,
-                position_ids=diff_position_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-                is_diffusion_pass=False,
-            )
-            ar_tokens, ar_probs = sample(ar_outputs.logits)
-
-            acceptance_len = 0
-            if temperature < 1e-5:
-                matches = (diff_tokens == ar_tokens[:, :-1])
-                acceptance_len = matches.cumprod(dim=1).sum(dim=1)[0].item()
-                next_token = ar_tokens[:, acceptance_len]
+            if num_drafts > 1 and temperature >= 1e-5 and diff_len > 1:
+                # Tree verification of several i.i.d. drafts (src/tree_verify.py).
+                acceptance_len, next_token, proposed_block = self._tree_verify_round(
+                    output_ids[:, start_idx:start_idx + 1], diff_probs[0],
+                    diff_position_ids, past_key_values, start_idx, num_drafts, sample,
+                )
             else:
-                for i in range(diff_tokens.shape[1]):
-                    q_prob = diff_probs[0, i, diff_tokens[0, i]]
-                    p_prob = ar_probs[0, i, diff_tokens[0, i]]
-                    if torch.rand(1, device=device).item() < min(1.0, (p_prob / max(q_prob, 1e-8)).item()):
-                        acceptance_len += 1
-                    else:
-                        break
-                
-                p_dist = ar_probs[0, acceptance_len]
-                if acceptance_len < diff_tokens.shape[1]:
-                    residual = torch.clamp(p_dist - diff_probs[0, acceptance_len], min=0.0)
-                    residual_sum = residual.sum()
-                    next_token = torch.multinomial(residual / residual_sum if residual_sum > 1e-5 else p_dist, 1)
-                else:
-                    next_token = torch.multinomial(p_dist, 1)
+                # Autoregressive Path for Intra-model Consistency
+                ar_outputs = self(
+                    input_ids=proposed_block,
+                    position_ids=diff_position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    is_diffusion_pass=False,
+                )
+                ar_tokens, ar_probs = sample(ar_outputs.logits)
 
+                acceptance_len = 0
+                if dblast_state is not None:
+                    branch_tokens, category_probs, chosen = dblast_state
+                    acceptance_len, next_token = dblast.greedy_branch_step(
+                        branch_tokens, category_probs, ar_probs[0], chosen)
+                elif noise_reveal is not None:
+                    # Verify against the revealed laws p(.|G_S) (lossless for p).
+                    acceptance_len, next_token = (
+                        noise_coupling.noise_conditioned_speculative_step(
+                            diff_tokens[0], diff_probs[0], ar_probs[0], *noise_reveal)
+                    )
+                elif temperature < 1e-5:
+                    matches = (diff_tokens == ar_tokens[:, :-1])
+                    acceptance_len = matches.cumprod(dim=1).sum(dim=1)[0].item()
+                    next_token = ar_tokens[:, acceptance_len]
+                else:
+                    for i in range(diff_tokens.shape[1]):
+                        q_prob = diff_probs[0, i, diff_tokens[0, i]]
+                        p_prob = ar_probs[0, i, diff_tokens[0, i]]
+                        if torch.rand(1, device=device).item() < min(1.0, (p_prob / max(q_prob, 1e-8)).item()):
+                            acceptance_len += 1
+                        else:
+                            break
+                
+                    p_dist = ar_probs[0, acceptance_len]
+                    if acceptance_len < diff_tokens.shape[1]:
+                        residual = torch.clamp(p_dist - diff_probs[0, acceptance_len], min=0.0)
+                        residual_sum = residual.sum()
+                        next_token = torch.multinomial(residual / residual_sum if residual_sum > 1e-5 else p_dist, 1)
+                    else:
+                        next_token = torch.multinomial(p_dist, 1)
+
+            acceptance_log = getattr(self, "_acceptance_log", None)
+            if acceptance_log is not None and diff_len > 1:
+                acceptance_log.append((int(acceptance_len), diff_len - 1))
             end_idx = start_idx + acceptance_len + 1
             accepted_block = proposed_block[:, :acceptance_len + 1]
             
