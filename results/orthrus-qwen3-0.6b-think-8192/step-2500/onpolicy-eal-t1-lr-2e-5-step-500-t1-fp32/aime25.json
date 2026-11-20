@@ -1,0 +1,37 @@
+{
+  "task": "aime25",
+  "num_samples": 30,
+  "max_new_tokens": 16384,
+  "temperature": 1.0,
+  "block_size": 32,
+  "orthrus": {
+    "label": "orthrus",
+    "generated_tokens": 369583,
+    "forward_passes": 154050,
+    "seconds": 9017.194,
+    "num_samples": 30,
+    "tpf": 2.3991,
+    "tokens_per_second": 40.99,
+    "consensus_cycles": 77010.0,
+    "acceptance_length": 3.7992
+  },
+  "accuracy_orthrus": 0.2,
+  "autoregressive": {
+    "label": "autoregressive",
+    "generated_tokens": 362282,
+    "forward_passes": 362282,
+    "seconds": 9840.193,
+    "num_samples": 30,
+    "tpf": 1.0,
+    "tokens_per_second": 36.82
+  },
+  "efficiency": {
+    "tpf_ar": 1.0,
+    "tpf_orthrus": 2.3991,
+    "tpf_ratio": 2.3991,
+    "wallclock_speedup": 1.1133,
+    "tokens_per_second_ar": 36.82,
+    "tokens_per_second_orthrus": 40.99
+  },
+  "accuracy_autoregressive": 0.1
+}
