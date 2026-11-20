@@ -74,6 +74,27 @@ def log_likelihoods(model, input_ids, seqs, temperature, batch=64):
     return scores
 
 
+def mean_position_tv(group_a, group_b, offset, span):
+    ca, cb = position_counts(group_a, offset, span), position_counts(group_b, offset, span)
+    n = min(len(group_a), len(group_b))
+    return sum(tv(x, y, n) for x, y in zip(ca, cb)) / span
+
+
+def permutation_p_value(group_a, group_b, offset, span, rounds, seed=0):
+    """P(statistic >= observed) under random relabelling of the pooled samples."""
+    import random
+
+    observed = mean_position_tv(group_a, group_b, offset, span)
+    pooled = list(group_a) + list(group_b)
+    rng = random.Random(seed)
+    hits = 0
+    for _ in range(rounds):
+        rng.shuffle(pooled)
+        split = pooled[:len(group_a)], pooled[len(group_a):]
+        hits += mean_position_tv(*split, offset, span) >= observed
+    return observed, (hits + 1) / (rounds + 1)
+
+
 def z_score(a, b):
     mean = lambda x: sum(x) / len(x)
     var = lambda x: sum((v - mean(x)) ** 2 for v in x) / (len(x) - 1)
@@ -113,6 +134,7 @@ def main():
     p.add_argument("--check-offset", type=int, default=16,
                    help="Skip this many generated tokens (thinking preamble) for the TV test.")
     p.add_argument("--check-span", type=int, default=8)
+    p.add_argument("--permutations", type=int, default=200)
     p.add_argument("--samples", type=int, default=2000)
     p.add_argument("--speed-tokens", type=int, default=512)
     p.add_argument("--speed-runs", type=int, default=5)
@@ -148,6 +170,14 @@ def main():
           f"mean empirical entropy {ent:.2f} nats")
     if ent < 0.3:
         print("   WARNING: these positions are nearly deterministic; raise --check-offset.")
+    # The floor above is one random draw; the permutation test asks how often a random
+    # split of the pooled samples gives a TV at least this large (p > 0.01 passes).
+    _, p_noise = permutation_p_value(noise, ar_a, args.check_offset, args.check_span,
+                                     args.permutations)
+    _, p_ar = permutation_p_value(ar_b, ar_a, args.check_offset, args.check_span,
+                                  args.permutations, seed=1)
+    print(f"   permutation test ({args.permutations} splits): noise vs AR p={p_noise:.3f} | "
+          f"AR vs AR p={p_ar:.3f}  (p > 0.01 passes)")
 
     la = log_likelihoods(model, input_ids, ar_a, args.temperature)
     lb = log_likelihoods(model, input_ids, ar_b, args.temperature)
@@ -160,11 +190,14 @@ def main():
     # 'causal only' separates the two costs of noise decoding on an untrained projection:
     # the causal in-block mask (the drafter was trained bidirectional) and verifying
     # against the sharper revealed laws with a drafter that ignores the noise.
+    # "noise off" runs again at the end: if its two speeds differ a lot, the timing is
+    # dominated by order / warm-up effects on this machine, not by the decoding mode.
     for label, setting, causal in (("noise off", None, False),
                                    ("causal only", None, True),
-                                   (f"noise top-{m}", m, False)):
+                                   (f"noise top-{m}", m, False),
+                                   ("noise off (again)", None, False)):
         speed, accept = run(model, input_ids, args, setting, causal)
-        print(f"{label:>14}: accepted/cycle={accept:.2f}  {speed:.1f} tok/s")
+        print(f"{label:>18}: accepted/cycle={accept:.2f}  {speed:.1f} tok/s")
 
 
 if __name__ == "__main__":
