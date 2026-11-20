@@ -61,6 +61,18 @@ def evaluate_task(model, tokenizer, task, args) -> dict:
     identical = mismatched = 0
     samples = []
 
+    if len(rows) and args.warmup_tokens > 0:
+        # Untimed warm-up of both decoders (CUDA context, kernel selection, allocator):
+        # without it the first timed example runs ~2x slower and biases tok/s.
+        warm_ids = build_input_ids(tokenizer, task.build_prompt(rows[0]),
+                                   enable_thinking=args.enable_thinking).to(model.device)
+        generate_orthrus(model, warm_ids, args.warmup_tokens, temperature=args.temperature,
+                         top_k=args.top_k, top_p=args.top_p, num_drafts=args.num_drafts)
+        if not args.no_baseline:
+            generate_autoregressive(model, warm_ids, args.warmup_tokens,
+                                    temperature=args.temperature, top_k=args.top_k,
+                                    top_p=args.top_p)
+
     model._acceptance_log = []          # (accepted, drafted) per cycle, from generate()
     for index, row in enumerate(rows):
         prompt = task.build_prompt(row)
@@ -214,6 +226,8 @@ def parse_args():
     p.add_argument("--dblast-category-temperature", type=float, default=None,
                    help="DBLAST checkpoints: override Z_T (paper: grid 0.0..1.4, chosen on "
                         "a held-out 10%% split per model and sampling regime).")
+    p.add_argument("--warmup-tokens", type=int, default=512,
+                   help="Untimed warm-up generation before each task (0 disables).")
     p.add_argument("--greedy-branch-drafts", action="store_true",
                    help="Decode a non-DBLAST checkpoint with DBLAST's greedy-branch rule "
                         "(K = 1: argmax draft + stochastic verification), as the paper "

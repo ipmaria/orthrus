@@ -105,8 +105,9 @@ def z_score(a, b):
 def run(model, input_ids, args, noise_m, causal=False):
     model.config.noise_reveal_top_m = noise_m
     model.config.causal_drafting = causal
-    model.generate(input_ids=input_ids, max_new_tokens=64, temperature=args.temperature,
-                   top_k=0, top_p=1.0)                                   # warm-up
+    for _ in range(2):                    # untimed warm-up at the measured length
+        model.generate(input_ids=input_ids, max_new_tokens=args.speed_tokens,
+                       temperature=args.temperature, top_k=0, top_p=1.0)
     tokens = passes = seconds = 0.0
     counter = ForwardPassCounter(model)
     for _ in range(args.speed_runs):
