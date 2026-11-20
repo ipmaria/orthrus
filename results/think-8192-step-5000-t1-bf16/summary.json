@@ -1,0 +1,42 @@
+{
+  "model_dir": "checkpoints/orthrus-qwen3-0.6b-think-8192/step-5000",
+  "results": [
+    {
+      "task": "aime25",
+      "num_samples": 30,
+      "max_new_tokens": 16384,
+      "temperature": 1.0,
+      "block_size": 32,
+      "orthrus": {
+        "label": "orthrus",
+        "generated_tokens": 380396,
+        "forward_passes": 180386,
+        "seconds": 5574.394,
+        "num_samples": 30,
+        "tpf": 2.1088,
+        "tokens_per_second": 68.24,
+        "consensus_cycles": 90178.0,
+        "acceptance_length": 3.2183
+      },
+      "accuracy_orthrus": 0.1667,
+      "autoregressive": {
+        "label": "autoregressive",
+        "generated_tokens": 383052,
+        "forward_passes": 383052,
+        "seconds": 9663.301,
+        "num_samples": 30,
+        "tpf": 1.0,
+        "tokens_per_second": 39.64
+      },
+      "efficiency": {
+        "tpf_ar": 1.0,
+        "tpf_orthrus": 2.1088,
+        "tpf_ratio": 2.1088,
+        "wallclock_speedup": 1.7215,
+        "tokens_per_second_ar": 39.64,
+        "tokens_per_second_orthrus": 68.24
+      },
+      "accuracy_autoregressive": 0.1333
+    }
+  ]
+}

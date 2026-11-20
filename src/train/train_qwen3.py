@@ -125,6 +125,20 @@ def _lm_head_weight(base_model):
     return weight
 
 
+def _replicated_spread(replicated) -> float:
+    """max over parameters and entries of (max over ranks - min over ranks); 0 = in sync."""
+    import torch.distributed as dist
+
+    spread = 0.0
+    for param in replicated:
+        value = param.detach().float()
+        high, low = value.clone(), value.clone()
+        dist.all_reduce(high, op=dist.ReduceOp.MAX)
+        dist.all_reduce(low, op=dist.ReduceOp.MIN)
+        spread = max(spread, float((high - low).abs().max()))
+    return spread
+
+
 def _sync_replicated_grads_and_clip(model, replicated, max_norm):
     """All-reduce (mean) replicated grads, then clip all grads by one global norm."""
     import torch.distributed as dist
@@ -412,8 +426,18 @@ def train(args):
         fsdp_modules = shard_decoder_layers(model, args.activation_checkpointing)
         log_main(is_main, f"FSDP2 initialized over {len(fsdp_modules)} decoder layers "
                           f"(root parameters left replicated for the loss).")
-    elif distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    else:
+        if args.activation_checkpointing:
+            # Without FSDP (single GPU or DDP) the flag used to be ignored silently.
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                apply_activation_checkpointing,
+            )
+            apply_activation_checkpointing(
+                model, check_fn=lambda submodule: isinstance(submodule, OrthrusDecoderLayer)
+            )
+            log_main(is_main, "Activation checkpointing on decoder layers (no FSDP).")
+        if distributed:
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     base_model = model.module if (distributed and not args.fsdp2) else model
     replicated_trainable = []
     if distributed and args.fsdp2:
@@ -573,6 +597,15 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             step += 1
 
+            if replicated_trainable and args.check_replicated_every > 0 \
+                    and step % args.check_replicated_every == 0:
+                # Every rank must hold bit-identical copies of the replicated root
+                # parameters (identical averaged grads -> identical AdamW updates).
+                spread = _replicated_spread(replicated_trainable)
+                log_main(is_main, f"step {step}: replicated root params, max |difference "
+                                  f"between ranks| = {spread:.3e}"
+                                  + ("  OK" if spread == 0.0 else "  <-- RANKS DIVERGED"))
+
             if is_main and step % args.log_every == 0:
                 now = time.perf_counter()
                 elapsed = max(now - last_log, 1e-6)
@@ -672,6 +705,10 @@ def parse_args():
                         "tokens of the noise-free proposal (saved in the config and "
                         "used by generate()). Train on teacher rollouts at "
                         "--eal-temperature.")
+    p.add_argument("--check-replicated-every", type=int, default=50,
+                   help="With --fsdp2 and trainable root parameters (noise-eal, dblast-*): "
+                        "every N optimizer steps, log the max difference of those "
+                        "parameters between GPUs. It must be exactly 0. 0 = off.")
     p.add_argument("--causal-drafting", action="store_true",
                    help="Control arm: causal in-block mask in the diffusion pass (as "
                         "noise-eal uses), without any noise. Saved in the config.")

@@ -39,8 +39,13 @@ from src.eval.tasks import TASKS, load_task_rows, run_code_sample, score_math
 
 def evaluate_task(model, tokenizer, task, args) -> dict:
     rows = load_task_rows(
-        task, limit=args.limit, hf_path=args.hf_path, hf_config=args.hf_config
+        task, limit=None if args.limit is None else args.offset + args.limit,
+        hf_path=args.hf_path, hf_config=args.hf_config,
     )
+    if args.offset:
+        # Skip the first --offset examples (held-out splits that do not overlap --limit).
+        rows = (rows.select(range(min(args.offset, len(rows)), len(rows)))
+                if hasattr(rows, "select") else list(rows)[args.offset:])
     max_new_tokens = args.max_new_tokens or task.max_new_tokens
     eos_token_id = getattr(model.config, "eos_token_id", None) or tokenizer.eos_token_id
 
@@ -194,6 +199,9 @@ def parse_args():
                         "livecodebench_v5 this selects the release, e.g. release_v5 "
                         "(cumulative v1..v5) or v5 (that window only).")
     p.add_argument("--limit", type=int, default=None, help="Cap examples per task.")
+    p.add_argument("--offset", type=int, default=0,
+                   help="Skip the first N examples per task (e.g. a held-out split for "
+                        "tuning that does not overlap the --limit examples of the main runs).")
     p.add_argument("--max-new-tokens", type=int, default=None,
                    help="Override the per-task default.")
     p.add_argument("--temperature", type=float, default=0.6,
