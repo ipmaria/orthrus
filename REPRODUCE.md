@@ -340,9 +340,88 @@ The additional frozen AR verification pass is training-only and does not change 
 It adds training time and activations, but no trainable parameters or KL regularizer.
 
 **Ablation:** `--eal-estimator target-path` preserves the earlier committed-target estimator
-with \(W_t=\prod_{s\leq t}\min(1,Q_s(x_s)/p_s(x_s))\). It is useful for comparison, but it
-estimates survival on dataset tokens rather than on drafts drawn from the current proposal,
-so it is not the default for temperature-1 on-policy training.
+with \(W_t=\prod_{s\leq t}\min(1,Q_s(x_s)/p_s(x_s))\). Note when it is exact: lossless
+verification makes the output follow \(p\) whatever the drafter, and
+\(P(\text{draft accepted},\ \text{output}=v)=\min(Q(v),p(v))\), so
+\(P(\text{accept}_t\mid x)=\min(1,Q_t(x_t)/p_t(x_t))\) along the output path. Averaged over
+**rollouts of the frozen teacher at the same temperature** (no top-p/top-k), target-path is
+an unbiased, score-free estimator of the same \(\mathbb{E}[J]\). On dataset text written by
+other models it is biased, which is where the sampled estimators below earn their extra
+verification pass.
+
+#### Rao-Blackwellised EAL (`--eal-estimator rb`)
+
+Same objective, lower variance. The verification pass already gives the full teacher
+distribution \(p_t(\cdot\mid y_{<t})\), and \(Q\) is factorized, so the last token of every
+survival term integrates out exactly:
+\(\mathbb{E}_{y_t\sim Q_t}[r_t\mid y_{<t}]=1-\mathrm{TV}(p_t,Q_t)=\sum_v\min(p_t(v),Q_t(v))\).
+Hence
+
+\[
+J_{\mathrm{RB}}(y)=\sum_{t=1}^{D} f_{t-1}\,\bigl(1-\mathrm{TV}(p_t,Q_t)\bigr),\qquad
+\mathbb{E}[J_{\mathrm{RB}}]=\mathbb{E}[J],
+\]
+
+with the pathwise gradient flowing through \(\mathrm{TV}\) and the score coefficient of
+\(\log Q_s(y_s)\) equal to \(\mathbf{1}[Q_s\le p_s]\sum_{t>s}f_{t-1}(1-\mathrm{TV}_t)\).
+`target-path` (dataset prefix, analytic last step, no score) and `onpolicy` (everything
+sampled) are the two ends of this family. Cost: one full-vocabulary `min` per position,
+inside the existing chunking.
+
+#### Several drafts per block and leave-one-out baselines (`--eal-num-drafts`, `--eal-baseline`)
+
+`--eal-num-drafts M` samples M i.i.d. drafts per block from the same proposal (one extra
+frozen verification pass each). For `onpolicy`/`rb` the M estimates are averaged and
+`--eal-baseline loo` subtracts, from each draft's score return, the mean return of the
+other M−1 drafts of the same block — independent of that draft, so still unbiased.
+
+#### Multi-draft tree verification (`--eal-estimator multidraft`)
+
+A one-step diffusion drafter produces M drafts for the price of one forward pass, and
+because its positions are factorized, the siblings at any node are i.i.d. draws from the
+same \(Q_s\). They can therefore be verified losslessly as a tree with SpecInfer-style
+recursive rejection: at depth \(s\) the chains that agree with the committed prefix are
+tried in order, with residual \(p^{(j+1)}\propto[p^{(j)}-Q_s]_+\). The objective is the
+tree's expected accepted length. The acceptance probability of a reached node is analytic,
+\(a_s=1-\prod_j \mathrm{TV}(p^{(j)},Q_s)\); the walk itself (tokens of the alive chains and
+the accept coins) is sampled and enters through the score with coefficient
+\(\sum_{t>s}\mathbf{1}[\text{reached }t]\,a_t\). The coins are drawn before the loss so that
+checkpoint recomputation replays the same walk. `--eal-baseline loo` uses the other blocks
+of the chunk at the same depth. **Deployment needs the matching tree verifier**
+(`generate()` currently verifies one draft); training with `multidraft` and decoding with
+one draft optimizes the wrong objective.
+
+```bash
+torchrun --nproc_per_node=8 -m src.train.train_qwen3 \
+  --model-dir checkpoints/orthrus-qwen3-8b-kl/final \
+  --packed-cache-path data/processed/orthrus-packed-2048-asst \
+  --output-dir checkpoints/orthrus-qwen3-8b-kl-rb-m4 \
+  --objective accepted-length --eal-estimator rb --eal-num-drafts 4 --eal-baseline loo \
+  --eal-temperature 1.0 --seq-len 2048 --epochs 1 --lr 2e-5 \
+  --micro-batch-size 1 --grad-accum-steps 16 --fsdp2 --activation-checkpointing
+```
+
+#### Multi-round objective (`--objective expected-rounds`)
+
+Per-round accepted length ignores where the next round starts; EDR (Zhao & Cai, 2026)
+shows that a drafter maximizing it in every round can be suboptimal for the number of
+rounds. `expected-rounds` samples windows of `--rounds-window-len` H consecutive anchors
+(`sample_window_anchors`), computes target-path survival for every round start in the
+window, and runs the occupancy recursion
+
+\[
+\omega_0=1,\qquad \omega_{n+j+1}\mathrel{+}=\omega_n\,P(L_n=j),\qquad
+\mathcal{L}=\tfrac{1}{H}\textstyle\sum_{n<H}\omega_n ,
+\]
+
+with \(P(L_n\ge j)=\prod_{i\le j}\min(1,Q^{(n)}_i/p_i)\) and one correction/bonus token per
+round. It is differentiated exactly through the recursion (no TD approximation). By the
+coupling above it equals the expected number of speculative-decoding rounds that start in
+the window **when the rows are teacher rollouts at `--eal-temperature`**; for that,
+generate the corpus with `scripts/generate_onpolicy.py --temperature T --top-p 1 --top-k -1`
+(check the flag names of your vLLM version) and train with the same T. No drafts are
+sampled, so there is no verification pass and no score-function variance. On dataset text
+it inherits target-path's bias. The log reports `tokens_per_round ≈ 1/loss`.
 
 **Scope:** on-policy EAL matches stochastic token-level speculative verification. It is not
 an objective for deterministic argmax-consensus decoding at `temperature=0`; that path uses
@@ -381,7 +460,11 @@ naive full-vocabulary reference. Target-path accepted-length tests compare value
 pathwise gradient against direct dense autograd and a finite difference. The on-policy
 test enumerates every draft path and differentiates the exact expectation directly,
 checking the combined pathwise and score-function gradient; mask truncation, block
-normalization, the acceptance cap, and empty supervision are also covered. Torch-only —
+normalization, the acceptance cap, and empty supervision are also covered. The `rb`,
+leave-one-out and `multidraft` tests do the same exact enumeration (for `multidraft` over
+both chains and every accept coin of the tree walk), and the `expected-rounds` test checks
+value and gradient against an exact simulation of speculative decoding, which is the
+coupling identity above. Torch-only —
 no CUDA, FlexAttention or transformers needed, so they run on a laptop.
 
 ---

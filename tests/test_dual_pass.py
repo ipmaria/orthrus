@@ -18,6 +18,7 @@ from src.train.loss import IGNORE_INDEX, block_local_labels
 from src.train.loss_kl import (
     fused_linear_accepted_length,
     fused_linear_cross_entropy,
+    fused_linear_expected_rounds,
     fused_linear_forward_kl,
 )
 
@@ -494,3 +495,393 @@ def test_onpolicy_dual_pass_preserves_batch_anchor_shape():
     label_grid = labels.reshape(batch, num_anchors, block_size)
     assert (label_grid[:, :, :-1] != IGNORE_INDEX).all()
     assert (label_grid[:, :, -1] == IGNORE_INDEX).all()
+
+
+# ---------------------------------------------------------------------------------
+# RB-EAL, leave-one-out baselines, multi-draft trees, expected rounds
+# ---------------------------------------------------------------------------------
+
+
+def _random_prefix_teacher(length, vocab, scale=0.7):
+    """A separate AR conditional (as logits) for every drafted prefix."""
+    table = {}
+    for s in range(length):
+        for prefix in product(range(vocab), repeat=s):
+            table[prefix] = torch.randn(vocab) * scale
+    return table
+
+
+def _exact_single_draft_ej(logits, teacher_logits):
+    length, vocab = logits.shape
+    q = F.softmax(logits, dim=-1)
+    total = logits.new_zeros(())
+    for path in product(range(vocab), repeat=length):
+        prob, survival, j = logits.new_ones(()), logits.new_ones(()), logits.new_zeros(())
+        for s, token in enumerate(path):
+            p_token = F.softmax(teacher_logits[path[:s]], dim=-1)[token]
+            survival = survival * torch.clamp(p_token / q[s, token], max=1.0)
+            j = j + survival
+            prob = prob * q[s, token]
+        total = total + prob * j
+    return total
+
+
+def _single_draft_inputs(logits, teacher_logits, paths):
+    """student [K, V], teacher [M*K, V], labels [M*K] for M drafts of one block."""
+    vocab = logits.shape[1]
+    student = torch.cat([logits, logits.new_zeros(1, vocab)], dim=0)
+    teachers, labels = [], []
+    for path in paths:
+        length = len(path)
+        teachers.append(torch.cat([
+            torch.stack([teacher_logits[path[:s]] for s in range(length)]),
+            torch.zeros(1, vocab),
+        ], dim=0))
+        labels.append(torch.tensor([*path, IGNORE_INDEX]))
+    return student, torch.cat(teachers, dim=0), torch.cat(labels, dim=0)
+
+
+def test_rb_eal_matches_exact_enumeration_including_score_gradient():
+    torch.manual_seed(31)
+    length, vocab = 3, 3
+    base = torch.randn(length, vocab) * 0.8
+    teacher_logits = _random_prefix_teacher(length, vocab, scale=0.9)
+    exact_logits = base.clone().requires_grad_(True)
+    exact = _exact_single_draft_ej(exact_logits, teacher_logits)
+    (-exact).backward()
+
+    est_logits = base.clone().requires_grad_(True)
+    q_fixed = F.softmax(base, dim=-1)
+    estimated = est_logits.new_zeros(())
+    for path in product(range(vocab), repeat=length):
+        weight = torch.stack([q_fixed[s, t] for s, t in enumerate(path)]).prod()
+        student, teacher, labels = _single_draft_inputs(est_logits, teacher_logits, [path])
+        estimated = estimated + weight * fused_linear_accepted_length(
+            torch.eye(vocab), student, teacher, labels, length + 1,
+            chunk_size=2, estimator="rb",
+        )
+    assert torch.allclose(estimated, -exact, atol=2e-6)
+    estimated.backward()
+    assert torch.allclose(est_logits.grad, exact_logits.grad, atol=3e-5), (
+        est_logits.grad, exact_logits.grad
+    )
+
+
+def test_leave_one_out_baseline_is_unbiased_with_two_drafts():
+    torch.manual_seed(37)
+    length, vocab = 2, 3
+    base = torch.randn(length, vocab) * 0.8
+    teacher_logits = _random_prefix_teacher(length, vocab, scale=0.9)
+    exact_logits = base.clone().requires_grad_(True)
+    (-_exact_single_draft_ej(exact_logits, teacher_logits)).backward()
+
+    q_fixed = F.softmax(base, dim=-1)
+    paths = list(product(range(vocab), repeat=length))
+    for estimator in ("onpolicy", "rb"):
+        est_logits = base.clone().requires_grad_(True)
+        estimated = est_logits.new_zeros(())
+        for first in paths:
+            for second in paths:
+                weight = torch.stack(
+                    [q_fixed[s, t] for s, t in enumerate(first)]
+                    + [q_fixed[s, t] for s, t in enumerate(second)]
+                ).prod()
+                student, teacher, labels = _single_draft_inputs(
+                    est_logits, teacher_logits, [first, second]
+                )
+                estimated = estimated + weight * fused_linear_accepted_length(
+                    torch.eye(vocab), student, teacher, labels, length + 1,
+                    chunk_size=4, estimator=estimator, num_drafts=2, baseline="loo",
+                )
+        estimated.backward()
+        assert torch.allclose(est_logits.grad, exact_logits.grad, atol=3e-5), (
+            estimator, est_logits.grad, exact_logits.grad
+        )
+
+
+def _residual_chain(p, q, count):
+    residuals, masses = [p], []
+    for _ in range(count):
+        excess = torch.clamp(residuals[-1] - q, min=0.0)
+        mass = excess.sum()
+        masses.append(mass)
+        residuals.append(excess / mass.clamp_min(1e-30))
+    return residuals[:count], masses
+
+
+def _exact_multidraft_el(logits, teacher_logits, num_drafts):
+    """sum_Y Q(Y) E_coins[accepted length] of tree verification, by recursion."""
+    length, vocab = logits.shape
+    q = F.softmax(logits, dim=-1)
+
+    def recurse(s, prefix, alive, chains):
+        if s == length or not alive:
+            return logits.new_zeros(())
+        p = F.softmax(teacher_logits[tuple(prefix)], dim=-1)
+        residuals, _ = _residual_chain(p, q[s], len(alive))
+        total, reach = logits.new_zeros(()), logits.new_ones(())
+        for j, chain in enumerate(alive):
+            token = chains[chain][s]
+            accept = torch.clamp(residuals[j][token] / q[s, token], max=1.0)
+            survivors = [c for c in alive if chains[c][s] == token]
+            total = total + reach * accept * (
+                1.0 + recurse(s + 1, prefix + [token], survivors, chains)
+            )
+            reach = reach * (1.0 - accept)
+        return total
+
+    total = logits.new_zeros(())
+    for flat in product(range(vocab), repeat=num_drafts * length):
+        chains = [flat[c * length:(c + 1) * length] for c in range(num_drafts)]
+        prob = torch.stack([q[s, chains[c][s]]
+                            for c in range(num_drafts) for s in range(length)]).prod()
+        total = total + prob * recurse(0, [], list(range(num_drafts)), chains)
+    return total
+
+
+def _decision_weight(q, teacher_logits, chains, decisions):
+    """Probability of the tested accept/reject decisions; 1/2 per untested slot."""
+    length = q.shape[0]
+    num_drafts = len(chains)
+    alive, prefix = list(range(num_drafts)), []
+    weight, tested = 1.0, torch.zeros(length, num_drafts, dtype=torch.bool)
+    for s in range(length):
+        p = F.softmax(teacher_logits[tuple(prefix)], dim=-1)
+        residuals, _ = _residual_chain(p, q[s], len(alive))
+        accepted = None
+        for j, chain in enumerate(alive):
+            token = chains[chain][s]
+            accept = min(1.0, (residuals[j][token] / q[s, token]).item())
+            tested[s, chain] = True
+            weight *= accept if decisions[s][chain] else 1.0 - accept
+            if decisions[s][chain]:
+                accepted = token
+                break
+        if accepted is None:
+            break
+        prefix.append(accepted)
+        alive = [c for c in alive if chains[c][s] == accepted]
+    return weight * 0.5 ** int((~tested).sum())
+
+
+def test_multidraft_tree_matches_exact_enumeration_including_score_gradient():
+    """Enumerate both drafted chains and every accept coin of the tree walk."""
+    torch.manual_seed(43)
+    length, vocab, num_drafts = 2, 3, 2
+    base = torch.randn(length, vocab) * 0.8
+    teacher_logits = _random_prefix_teacher(length, vocab, scale=0.9)
+    exact_logits = base.clone().requires_grad_(True)
+    exact = _exact_multidraft_el(exact_logits, teacher_logits, num_drafts)
+    (-exact).backward()
+
+    q_fixed = F.softmax(base, dim=-1)
+    est_logits = base.clone().requires_grad_(True)
+    estimated = est_logits.new_zeros(())
+    for flat in product(range(vocab), repeat=num_drafts * length):
+        chains = [flat[c * length:(c + 1) * length] for c in range(num_drafts)]
+        token_weight = torch.stack([q_fixed[s, chains[c][s]]
+                                    for c in range(num_drafts)
+                                    for s in range(length)]).prod().item()
+        student, teacher, labels = _single_draft_inputs(est_logits, teacher_logits, chains)
+        for bits in product((False, True), repeat=length * num_drafts):
+            decisions = [bits[s * num_drafts:(s + 1) * num_drafts] for s in range(length)]
+            weight = token_weight * _decision_weight(q_fixed, teacher_logits, chains,
+                                                     decisions)
+            if weight == 0.0:
+                continue
+            # u = 0 accepts whenever the acceptance probability is positive; u = 1 never.
+            uniforms = torch.tensor(
+                [[0.0 if decisions[s][c] else 1.0 for c in range(num_drafts)]
+                 for s in range(length)]
+            ).unsqueeze(0)
+            estimated = estimated + weight * fused_linear_accepted_length(
+                torch.eye(vocab), student, teacher, labels, length + 1,
+                chunk_size=8, estimator="multidraft", num_drafts=num_drafts,
+                uniforms=uniforms,
+            )
+    assert torch.allclose(estimated, -exact, atol=2e-6), (estimated, exact)
+    estimated.backward()
+    assert torch.allclose(est_logits.grad, exact_logits.grad, atol=3e-5), (
+        est_logits.grad, exact_logits.grad
+    )
+    # Two i.i.d. drafts verified as a tree accept more than one draft does.
+    single = _exact_single_draft_ej(base, teacher_logits)
+    assert exact.item() > single.item()
+
+
+def test_multidraft_with_one_draft_has_single_draft_mean():
+    torch.manual_seed(47)
+    length, vocab = 3, 2
+    base = torch.randn(length, vocab)
+    teacher_logits = _random_prefix_teacher(length, vocab)
+    q_fixed = F.softmax(base, dim=-1)
+    estimated = 0.0
+    for path in product(range(vocab), repeat=length):
+        weight = torch.stack([q_fixed[s, t] for s, t in enumerate(path)]).prod().item()
+        student, teacher, labels = _single_draft_inputs(base, teacher_logits, [path])
+        for bits in product((False, True), repeat=length):
+            decisions = [(b,) for b in bits]
+            w = weight * _decision_weight(q_fixed, teacher_logits, [path], decisions)
+            uniforms = torch.tensor([[0.0 if b else 1.0] for b in bits]).unsqueeze(0)
+            estimated += w * fused_linear_accepted_length(
+                torch.eye(vocab), student, teacher, labels, length + 1,
+                estimator="multidraft", num_drafts=1, uniforms=uniforms,
+            ).item()
+    exact = _exact_single_draft_ej(base, teacher_logits).item()
+    assert abs(estimated + exact) < 2e-6
+
+
+def _exact_expected_rounds(draft_logits, target_logits, window_len, depth, vocab):
+    """Simulate stochastic speculative decoding exactly; count rounds starting < H."""
+
+    def rounds_from(prefix):
+        if len(prefix) >= window_len:
+            return draft_logits[()].new_zeros(())
+        q = F.softmax(draft_logits[tuple(prefix)], dim=-1)            # [depth, vocab]
+
+        def branch(j, committed, prob):
+            p = F.softmax(target_logits[tuple(committed)], dim=-1)
+            if j == depth:                                              # bonus token
+                return sum(prob * p[v] * rounds_from(committed + [v]) for v in range(vocab))
+            out = sum(
+                branch(j + 1, committed + [v], prob * q[j, v] * torch.clamp(p[v] / q[j, v],
+                                                                           max=1.0))
+                for v in range(vocab)
+            )
+            residual = torch.clamp(p - q[j], min=0.0)
+            return out + sum(prob * residual[v] * rounds_from(committed + [v])
+                             for v in range(vocab))
+
+        return 1.0 + branch(0, list(prefix), 1.0)
+
+    return rounds_from([])
+
+
+def test_expected_rounds_on_teacher_rollouts_equals_exact_speculative_decoding():
+    """Coupling: averaging the occupancy objective over x ~ p is EXACT, value and grad."""
+    torch.manual_seed(53)
+    window_len, depth, vocab = 3, 2, 2
+    block_size = depth + 1
+    horizon = window_len + depth
+    target_logits = {}
+    for t in range(horizon + 2):
+        for prefix in product(range(vocab), repeat=t):
+            target_logits[prefix] = torch.randn(vocab) * 1.2
+    base = {prefix: torch.randn(depth, vocab) * 1.2
+            for t in range(window_len) for prefix in product(range(vocab), repeat=t)}
+
+    exact_params = {k: v.clone().requires_grad_(True) for k, v in base.items()}
+    exact = _exact_expected_rounds(exact_params, target_logits, window_len, depth, vocab)
+    exact.backward()
+
+    est_params = {k: v.clone().requires_grad_(True) for k, v in base.items()}
+    estimated = 0.0
+    for x in product(range(vocab), repeat=horizon):
+        p_x = 1.0
+        for t in range(horizon):
+            p_x *= F.softmax(target_logits[x[:t]], dim=-1)[x[t]].item()
+        # One window of anchors n = 0..H-1; block n drafts x[n .. n+depth-1].
+        student = torch.cat([
+            torch.cat([est_params[x[:n]], torch.zeros(1, vocab)], dim=0)
+            for n in range(window_len)
+        ], dim=0)
+        teacher = torch.cat([
+            torch.cat([torch.stack([target_logits[x[:n + j]] for j in range(depth)]),
+                       torch.zeros(1, vocab)], dim=0)
+            for n in range(window_len)
+        ], dim=0)
+        labels = torch.cat([
+            torch.tensor([*x[n:n + depth], IGNORE_INDEX]) for n in range(window_len)
+        ])
+        estimated = estimated + p_x * window_len * fused_linear_expected_rounds(
+            torch.eye(vocab), student, teacher, labels, block_size, window_len,
+            chunk_size=2,
+        )
+    assert torch.allclose(estimated, exact, atol=1e-5), (estimated, exact)
+    estimated.backward()
+    for key in base:
+        assert torch.allclose(est_params[key].grad, exact_params[key].grad, atol=1e-5), key
+
+
+def test_expected_rounds_reduces_to_one_round_per_block_when_nothing_is_accepted():
+    vocab, block_size, window_len = 3, 4, 5
+    num_blocks = window_len
+    weight = torch.eye(vocab)
+    teacher = torch.zeros(num_blocks * block_size, vocab)
+    teacher[:, 0] = 30.0                                   # p puts all mass on token 0
+    student = torch.zeros(num_blocks * block_size, vocab, requires_grad=True)
+    with torch.no_grad():
+        student[:, 1] = 30.0                               # Q puts ~no mass on token 0
+    labels = torch.zeros(num_blocks * block_size, dtype=torch.long)
+    labels.reshape(num_blocks, block_size)[:, -1] = IGNORE_INDEX
+    loss = fused_linear_expected_rounds(weight, student, teacher, labels,
+                                        block_size, window_len)
+    # Every round commits exactly one token: rounds/token = 1.
+    assert torch.allclose(loss, torch.tensor(1.0), atol=1e-6)
+
+
+def test_window_anchors_are_contiguous_inside_assistant_runs():
+    from src.utils.anchors import sample_window_anchors
+
+    seq_len, block_size, window_len = 64, 4, 5
+    input_ids = torch.zeros(2, seq_len, dtype=torch.long)
+    mask = torch.zeros(2, seq_len, dtype=torch.bool)
+    mask[0, 10:30] = True
+    mask[0, 40:58] = True
+    mask[1, 5:8] = True                                    # too short for any window
+    anchors, valid = sample_window_anchors(
+        input_ids, block_size, num_windows=3, window_len=window_len,
+        generator=torch.Generator().manual_seed(0), assistant_mask=mask,
+    )
+    assert anchors.shape == valid.shape == (2, 3 * window_len)
+    assert not valid[1].any()
+    windows = anchors[0].reshape(3, window_len)
+    window_valid = valid[0].reshape(3, window_len)
+    assert window_valid.all()
+    for window in windows:
+        assert torch.equal(window, window[0] + torch.arange(window_len))
+        assert mask[0, window].all()
+        assert int(window[-1]) <= seq_len - block_size
+    starts = windows[:, 0]
+    assert torch.all(starts[1:] - starts[:-1] >= window_len)
+
+
+def test_onpolicy_dual_pass_multiple_drafts_shapes():
+    torch.manual_seed(59)
+    batch, num_anchors, block_size, num_drafts = 2, 3, 4, 3
+    seq_len, hidden_size, vocab = 32, 5, 11
+    input_ids = torch.randint(0, vocab, (batch, seq_len))
+    anchors = torch.tensor([[1, 8, 15], [2, 9, 16]])
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.calls.append(kwargs)
+            hidden = torch.randn(
+                *input_ids.shape, hidden_size,
+            ).requires_grad_(kwargs.get("is_diffusion_pass", False))
+            cache = object() if kwargs.get("use_cache", False) else None
+            return SimpleNamespace(hidden_states=(hidden,), past_key_values=cache)
+
+    model = FakeModel()
+    student, teacher, keep, labels = dual_pass_forward(
+        model, input_ids=input_ids, anchors=anchors, block_size=block_size,
+        mask_token_id=MASK_ID, on_policy=True, lm_head_weight=torch.randn(vocab, hidden_size),
+        sampling_generator=torch.Generator().manual_seed(61), num_drafts=num_drafts,
+    )
+    num_positions = batch * num_anchors * block_size
+    assert len(model.calls) == 2 + num_drafts
+    assert all(call["is_verification_pass"] for call in model.calls[2:])
+    assert student.shape == (num_positions, hidden_size)
+    assert teacher.shape == (num_drafts * num_positions, hidden_size)
+    assert labels.shape == (num_drafts * num_positions,)
+    assert keep.shape == (num_positions,)
+
+    loss = fused_linear_accepted_length(
+        torch.randn(vocab, hidden_size), student, teacher, labels, block_size,
+        chunk_size=5, estimator="rb", num_drafts=num_drafts, baseline="loo",
+    )
+    loss.backward()
+    assert torch.isfinite(loss)

@@ -119,6 +119,7 @@ def dual_pass_forward(
     sampling_temperature: float = 1.0,
     sampling_generator: torch.Generator | None = None,
     sampling_chunk_size: int = 1024,
+    num_drafts: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the frozen AR pass and the trainable diffusion pass over one micro-batch.
 
@@ -135,7 +136,17 @@ def dual_pass_forward(
     diffusion view. A second frozen AR verification pass follows each sampled
     block causally, and the returned labels/teacher rows describe that draft path
     rather than the committed target path.
+
+    With num_drafts=M > 1 (on-policy only), M independent drafts are sampled from the
+    same proposal and each gets its own verification pass. student_hidden stays
+    [N, hidden] (the proposal does not depend on the draft); teacher_hidden and labels
+    become draft-major [M * N, ...]. keep_mask is the [N] position mask (identical for
+    every draft).
     """
+    if num_drafts < 1:
+        raise ValueError("num_drafts must be >= 1.")
+    if num_drafts > 1 and not on_policy:
+        raise ValueError("num_drafts > 1 requires on_policy=True.")
     batch_size, seq_len = input_ids.shape
     num_anchors = anchors.shape[1]
 
@@ -189,43 +200,52 @@ def dual_pass_forward(
     if on_policy:
         if lm_head_weight is None:
             raise ValueError("lm_head_weight is required for on-policy EAL.")
-        sampled_tokens = sample_draft_tokens(
-            lm_head_weight,
-            student.reshape(-1, hidden_size),
-            block_size,
-            chunk_size=sampling_chunk_size,
-            temperature=sampling_temperature,
-            generator=sampling_generator,
-        ).reshape(batch_size, num_anchors, block_size - 1)
-        draft_blocks = block_ids.reshape(batch_size, num_anchors, block_size).clone()
-        draft_blocks[:, :, 1:] = sampled_tokens
-
         # The target p_s must follow y_<s, not the committed dataset tokens.
-        # This pass uses AR projections and a causal within-block mask; gradients
-        # remain stopped and use_cache=False keeps the shared clean cache intact.
-        with torch.no_grad():
-            verification_outputs = model(
-                input_ids=draft_blocks.reshape(batch_size, num_anchors * block_size),
-                position_ids=block_positions,
-                past_key_values=shared_cache,
-                use_cache=False,
-                is_verification_pass=True,
-                causal_limit=causal_limit,
-                ar_seq_len=seq_len,
-                logits_to_keep=1,
-            )
-        teacher = verification_outputs.hidden_states[0].detach().reshape(
-            batch_size, num_anchors, block_size, hidden_size
-        )
-
-        sampled_labels = torch.full_like(labels, IGNORE_INDEX)
-        sampled_labels[:, :, :-1] = draft_blocks[:, :, 1:]
         target_prefix = (labels[:, :, :-1] != IGNORE_INDEX).cumprod(dim=-1).bool()
-        sampled_labels[:, :, :-1] = sampled_labels[:, :, :-1].masked_fill(
-            ~target_prefix, IGNORE_INDEX
+        draft_teachers, draft_labels = [], []
+        for _ in range(num_drafts):
+            sampled_tokens = sample_draft_tokens(
+                lm_head_weight,
+                student.reshape(-1, hidden_size),
+                block_size,
+                chunk_size=sampling_chunk_size,
+                temperature=sampling_temperature,
+                generator=sampling_generator,
+            ).reshape(batch_size, num_anchors, block_size - 1)
+            draft_blocks = block_ids.reshape(batch_size, num_anchors, block_size).clone()
+            draft_blocks[:, :, 1:] = sampled_tokens
+
+            # This pass uses AR projections and a causal within-block mask; gradients
+            # remain stopped and use_cache=False keeps the shared clean cache intact.
+            with torch.no_grad():
+                verification_outputs = model(
+                    input_ids=draft_blocks.reshape(batch_size, num_anchors * block_size),
+                    position_ids=block_positions,
+                    past_key_values=shared_cache,
+                    use_cache=False,
+                    is_verification_pass=True,
+                    causal_limit=causal_limit,
+                    ar_seq_len=seq_len,
+                    logits_to_keep=1,
+                )
+            draft_teachers.append(verification_outputs.hidden_states[0].detach().reshape(
+                batch_size, num_anchors, block_size, hidden_size
+            ))
+
+            sampled_labels = torch.full_like(labels, IGNORE_INDEX)
+            sampled_labels[:, :, :-1] = draft_blocks[:, :, 1:]
+            sampled_labels[:, :, :-1] = sampled_labels[:, :, :-1].masked_fill(
+                ~target_prefix, IGNORE_INDEX
+            )
+            draft_labels.append(sampled_labels)
+
+        keep_mask = draft_labels[0] != IGNORE_INDEX
+        return (
+            student.reshape(-1, hidden_size),
+            torch.stack(draft_teachers).reshape(-1, hidden_size),
+            keep_mask.reshape(-1),
+            torch.stack(draft_labels).reshape(-1),
         )
-        labels = sampled_labels
-        keep_mask = labels != IGNORE_INDEX
 
     return (
         student.reshape(-1, hidden_size),

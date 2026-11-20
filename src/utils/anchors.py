@@ -98,3 +98,73 @@ def sample_batch_anchors(
         if num_found < num_slots:
             anchors[batch, num_found:] = row_anchors[-1]
     return anchors, anchor_valid
+
+
+def sample_window_anchors(
+    input_ids,
+    block_size: int,
+    num_windows: int,
+    window_len: int,
+    generator=None,
+    assistant_mask=None,
+):
+    """Contiguous anchor windows for the multi-round (expected-rounds) objective.
+
+    Each window is `window_len` consecutive anchors s, s+1, ..., s+H-1 that all lie in
+    ONE assistant run (or anywhere in the row without a mask) and leave room for a
+    full block. Windows within a row do not overlap and are sorted, so the flattened
+    anchors stay ascending. Returns `(anchors, anchor_valid)`, each
+    [batch, num_windows * window_len]; a row with fewer feasible windows repeats its
+    first window (or position 1) with anchor_valid=False.
+    """
+    if num_windows <= 0 or window_len <= 0:
+        raise ValueError("num_windows and window_len must be positive.")
+    batch_size, seq_len = input_ids.shape
+    device = input_ids.device
+    if seq_len - block_size < window_len:
+        raise ValueError(
+            f"seq_len {seq_len} too short for a window of {window_len} anchors with "
+            f"block_size {block_size}."
+        )
+    num_slots = num_windows * window_len
+    anchors = torch.ones((batch_size, num_slots), dtype=torch.long, device=device)
+    anchor_valid = torch.zeros((batch_size, num_slots), dtype=torch.bool, device=device)
+    offsets = torch.arange(window_len, device=device)
+
+    for batch in range(batch_size):
+        eligible = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        if assistant_mask is None:
+            eligible[1 : seq_len - block_size + 1] = True
+        else:
+            candidates = assistant_anchor_candidates(
+                assistant_mask[batch][:seq_len], block_size, seq_len
+            )
+            eligible[candidates] = True
+        # A start s is feasible iff s .. s+H-1 are all eligible. Consecutive assistant
+        # candidates come from one run, since a run boundary is a non-assistant token.
+        counts = torch.cumsum(
+            torch.cat([torch.zeros(1, dtype=torch.long, device=device),
+                       eligible.to(torch.long)]),
+            dim=0,
+        )
+        starts = torch.arange(seq_len - window_len + 1, device=device)
+        feasible = starts[(counts[starts + window_len] - counts[starts]) == window_len]
+        if feasible.numel() == 0:
+            continue
+
+        order = torch.randperm(feasible.numel(), generator=generator, device=device)
+        chosen = []
+        for index in order.tolist():
+            start = int(feasible[index])
+            if all(abs(start - other) >= window_len for other in chosen):
+                chosen.append(start)
+                if len(chosen) == num_windows:
+                    break
+        chosen.sort()
+        row = torch.cat([start + offsets for start in chosen])
+        anchors[batch, : row.numel()] = row
+        anchor_valid[batch, : row.numel()] = True
+        if row.numel() < num_slots:
+            filler = (chosen[0] + offsets).repeat(num_windows - len(chosen))
+            anchors[batch, row.numel():] = filler
+    return anchors, anchor_valid

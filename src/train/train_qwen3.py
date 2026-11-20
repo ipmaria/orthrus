@@ -21,7 +21,10 @@ backbone with hard-label cross-entropy. Two differences, both deliberate:
   * `--objective kl` (default) minimises the forward KL against the frozen AR head
     (Eq. 7). `--objective ce` reproduces the Table 5 ablation arm.
     `--objective accepted-length` fine-tunes an already trained diffusion checkpoint
-    with sampled-draft on-policy accepted length under stochastic verification.
+    with sampled-draft on-policy accepted length under stochastic verification
+    (estimators: target-path / onpolicy / rb / multidraft, see loss_kl.py).
+    `--objective expected-rounds` fine-tunes it on expected verification rounds per
+    token over windows of contiguous anchors (multi-round, occupancy-weighted).
 
 Defaults follow Table 4 (256 anchors, K=32, 2 epochs, lr 2e-4, warmup 0.05, global batch
 128) with two deliberate departures for thinking-mode data: L=4096 instead of 2048, so a
@@ -61,8 +64,10 @@ from src.train.checkpoint import (
 )
 from src.train.dual_pass import dual_pass_forward
 from src.train.loss_kl import (
+    ACCEPTED_LENGTH_ESTIMATORS,
     fused_linear_accepted_length,
     fused_linear_cross_entropy,
+    fused_linear_expected_rounds,
     fused_linear_forward_kl,
 )
 from src.utils.data_utils import create_packed_dataloader
@@ -73,6 +78,7 @@ try:
 except ImportError:
     # ...but that module imports the Qwen3.5 backbone, which hard-imports `fla`.
     from src.utils.anchors import sample_batch_anchors
+from src.utils.anchors import sample_window_anchors
 
 from src.utils.init_model_qwen3 import (
     copy_diff_from_ar,
@@ -86,6 +92,8 @@ from src.utils.logging import (
     log_main,
     mix_seed,
 )
+
+STAGE_TWO_OBJECTIVES = ("accepted-length", "expected-rounds")
 
 try:
     import wandb
@@ -199,7 +207,7 @@ def train(args):
     model = OrthrusLM.from_pretrained(weights_dir, config=cfg, dtype=dtype)
 
     if resume_dir is None:
-        if args.objective == "accepted-length":
+        if args.objective in STAGE_TWO_OBJECTIVES:
             # Stage two must continue from the stage-one diffusion weights. Recopying
             # the AR projections here would silently erase the CE/KL warm start.
             log_main(
@@ -261,10 +269,17 @@ def train(args):
         "kl": "Eq. 7: forward KL vs the frozen AR teacher",
         "ce": "Table 5 ablation arm: hard-label cross-entropy",
         "accepted-length": "stage 2: negative accepted length (stochastic decoding)",
+        "expected-rounds": "stage 2: expected verification rounds per token (multi-round)",
     }[args.objective]
     log_main(is_main, f"Objective | {args.objective.upper()}  ({objective_description})")
     if args.objective == "accepted-length":
         log_main(is_main, f"EAL | estimator={args.eal_estimator} | "
+                          f"drafts/block={args.eal_num_drafts} | "
+                          f"baseline={args.eal_baseline} | "
+                          f"temperature={args.eal_temperature}")
+    if args.objective == "expected-rounds":
+        log_main(is_main, f"Rounds | window_len={args.rounds_window_len} | "
+                          f"windows/row={args.num_anchor_blocks // args.rounds_window_len} | "
                           f"temperature={args.eal_temperature}")
     log_main(is_main, f"Config | seq_len={args.seq_len} | block_size={block_size} | "
                       f"micro_bsz={args.micro_batch_size} | grad_accum={args.grad_accum_steps} | "
@@ -344,16 +359,25 @@ def train(args):
 
             with amp_context():
                 anchor_gen.manual_seed(mix_seed(args.seed, epoch, rank, batch_idx))
-                anchors, anchor_valid = sample_batch_anchors(
-                    input_ids, block_size, args.num_anchor_blocks,
-                    generator=anchor_gen, assistant_mask=assistant_mask,
-                )
+                if args.objective == "expected-rounds":
+                    anchors, anchor_valid = sample_window_anchors(
+                        input_ids, block_size,
+                        num_windows=args.num_anchor_blocks // args.rounds_window_len,
+                        window_len=args.rounds_window_len,
+                        generator=anchor_gen, assistant_mask=assistant_mask,
+                    )
+                else:
+                    anchors, anchor_valid = sample_batch_anchors(
+                        input_ids, block_size, args.num_anchor_blocks,
+                        generator=anchor_gen, assistant_mask=assistant_mask,
+                    )
 
                 head_weight = _lm_head_weight(base_model)
                 on_policy_eal = (
                     args.objective == "accepted-length"
-                    and args.eal_estimator == "onpolicy"
+                    and args.eal_estimator != "target-path"
                 )
+                num_drafts = args.eal_num_drafts if on_policy_eal else 1
                 student, teacher, keep_mask, labels = dual_pass_forward(
                     model,
                     input_ids=input_ids,
@@ -367,6 +391,7 @@ def train(args):
                     sampling_temperature=args.eal_temperature,
                     sampling_generator=anchor_gen,
                     sampling_chunk_size=args.loss_chunk_size,
+                    num_drafts=num_drafts,
                 )
 
                 if args.objective == "kl":
@@ -379,7 +404,17 @@ def train(args):
                         head_weight, student, teacher, labels,
                         block_size=block_size, chunk_size=args.loss_chunk_size,
                         temperature=args.eal_temperature,
-                        on_policy=on_policy_eal,
+                        estimator=args.eal_estimator,
+                        num_drafts=num_drafts,
+                        baseline=args.eal_baseline,
+                        generator=anchor_gen,
+                    )
+                elif args.objective == "expected-rounds":
+                    loss = fused_linear_expected_rounds(
+                        head_weight, student, teacher, labels,
+                        block_size=block_size, window_len=args.rounds_window_len,
+                        chunk_size=args.loss_chunk_size,
+                        temperature=args.eal_temperature,
                     )
                 else:
                     loss = fused_linear_cross_entropy(
@@ -422,6 +457,10 @@ def train(args):
                     f" accepted_length={-loss_value:.4f}"
                     if args.objective == "accepted-length" else ""
                 )
+                if args.objective == "expected-rounds":
+                    accepted_length_log = (
+                        f" tokens_per_round~{1.0 / max(loss_value, 1e-6):.3f}"
+                    )
                 log_main(is_main, f"[train] epoch={epoch + 1}/{args.epochs} step={step} "
                                   f"{args.objective}_loss={loss_value:.4f} "
                                   f"lr={optimizer.param_groups[0]['lr']:.2e} "
@@ -435,6 +474,8 @@ def train(args):
                                "train/epoch": epoch + 1}
                     if args.objective == "accepted-length":
                         metrics["train/accepted_length"] = -loss_value
+                    if args.objective == "expected-rounds":
+                        metrics["train/tokens_per_round"] = 1.0 / max(loss_value, 1e-6)
                     wandb_run.log(metrics, step=step)
 
             if args.save_every > 0 and step % args.save_every == 0:
@@ -488,19 +529,36 @@ def parse_args():
                         "OrthrusModel.forward builds a real causal mask for them.")
     # Objective
     p.add_argument("--objective", type=str, default="kl",
-                   choices=["kl", "ce", "accepted-length"],
+                   choices=["kl", "ce", "accepted-length", "expected-rounds"],
                    help="kl = paper Eq. 7 (forward KL vs the frozen AR head). "
                         "ce = the hard-label arm ablated in Table 5. "
                         "accepted-length = stage-2 on-policy EAL from an existing "
-                        "CE/KL diffusion checkpoint (stochastic decoding).")
+                        "CE/KL diffusion checkpoint (stochastic decoding). "
+                        "expected-rounds = stage-2 multi-round objective (expected "
+                        "verification rounds per token over contiguous anchor windows).")
     p.add_argument("--loss-chunk-size", type=int, default=1024,
                    help="Positions per recomputed logit chunk. Peak activation memory is "
                         "~4 x chunk x vocab x 4B; lower it if the loss OOMs.")
     p.add_argument("--eal-estimator", type=str, default="onpolicy",
-                   choices=["onpolicy", "target-path"],
+                   choices=list(ACCEPTED_LENGTH_ESTIMATORS),
                    help="onpolicy = sampled drafts with p/Q survival and the full "
-                        "pathwise + score-function gradient; target-path = the previous "
-                        "committed-target Q/p pathwise estimator (ablation).")
+                        "pathwise + score-function gradient; rb = the same objective "
+                        "with the last token of each survival term integrated out "
+                        "(1 - TV), lower variance; multidraft = expected accepted length "
+                        "of tree verification over --eal-num-drafts i.i.d. drafts; "
+                        "target-path = committed-target Q/p pathwise estimator (exact "
+                        "on teacher rollouts, biased on dataset text).")
+    p.add_argument("--eal-num-drafts", type=int, default=1,
+                   help="Drafts sampled per block (one verification pass each). "
+                        "onpolicy/rb: averaged, enables --eal-baseline loo; "
+                        "multidraft: the number of chains in the verified tree.")
+    p.add_argument("--eal-baseline", type=str, default="loo", choices=["none", "loo"],
+                   help="Score-function baseline. onpolicy/rb: leave-one-out over the "
+                        "drafts of the same block (needs --eal-num-drafts >= 2); "
+                        "multidraft: leave-one-out over blocks at the same depth.")
+    p.add_argument("--rounds-window-len", type=int, default=64,
+                   help="expected-rounds: consecutive anchors per window; "
+                        "--num-anchor-blocks // this many windows per row.")
     p.add_argument("--eal-temperature", type=float, default=1.0,
                    help="Positive temperature used both to sample drafts and to compute "
                         "p/Q in EAL. Set it to the stochastic evaluation temperature.")
@@ -544,6 +602,15 @@ def parse_args():
         raise ValueError("--micro-batch-size must be > 0.")
     if not 0.0 < args.eal_temperature < float("inf"):
         raise ValueError("--eal-temperature must be finite and positive.")
+    if args.eal_num_drafts < 1:
+        raise ValueError("--eal-num-drafts must be >= 1.")
+    if args.eal_estimator == "target-path" and args.eal_num_drafts != 1:
+        raise ValueError("--eal-estimator target-path scores one committed path; "
+                         "use --eal-num-drafts 1.")
+    if args.objective == "expected-rounds" and not (
+        1 <= args.rounds_window_len <= args.num_anchor_blocks
+    ):
+        raise ValueError("--rounds-window-len must be in [1, --num-anchor-blocks].")
     return args
 
 
